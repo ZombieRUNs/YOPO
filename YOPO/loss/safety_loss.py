@@ -22,7 +22,7 @@ class SafetyLoss(nn.Module):
         self.sgm_time = cfg["sgm_time"]
         self.eval_points = 30
         self.device = self._L.device
-        self.truncate_cost = False  # truncate cost at collision or use full trajectory cost
+        self.time_integral = True
 
         # SDF
         self.voxel_size = 0.2
@@ -59,27 +59,17 @@ class SafetyLoss(nn.Module):
         # get info from sdf_map
         cost, dist = self.get_distance_cost(pos_batch, map_id)
 
-        if not self.truncate_cost:
-            # Compute time integral of full trajectory cost (for general scenario)
-            cost_dt = (cost * dt).reshape(-1, pos_coe.shape[1])  # [B*H*V, N]
-            cost_colli = cost_dt.sum(dim=-1)
+        if self.time_integral:
+            # Compute average time integral of trajectory cost
+            # Issue: uneven eval points may undercut cost by quickly crossing obstacles
+            cost_colli = cost.reshape(-1, pos_coe.shape[1]).mean(dim=-1)  # [B*H*V, N]
         else:
-            # Only compute cost before the first collision (better for large-obstacle scenario)
-            dist = dist.view(batch_size, -1)  # [B*H*V, N]
-            cost = cost.view(batch_size, -1)  # [B*H*V, N]
-
-            N = dist.shape[1]
-            mask = dist <= 0  # [B*H*V, N]
-            index = th.where(mask, th.arange(N).to(self.device).expand(batch_size, N), N - 1)
-            first_colli_idx = index.min(dim=1).values  # [B*H*V]
-
-            arange = th.arange(N).to(self.device).unsqueeze(0).expand(batch_size, N)  # [B*H*V, N]
-            valid_mask = arange <= first_colli_idx.unsqueeze(1)  # [B*H*V, N]
-
-            masked_cost = cost * valid_mask
-            valid_count = first_colli_idx + 1
-
-            cost_colli = self.sgm_time * masked_cost.sum(dim=-1) / valid_count
+            # Compute average line integral of trajectory cost
+            vel_coe = self.get_velocity_from_coeff(coe, t_list)
+            vel_coe = vel_coe.norm(dim=-1)
+            line_integral_cost = (cost.reshape(-1, pos_coe.shape[1]) * vel_coe * dt).sum(dim=1)  # [B*H*V, N] -> [B*H*V]
+            line_length = (vel_coe * dt).sum(dim=1)  # [B*H*V]
+            cost_colli = line_integral_cost / line_length  # [B*H*V]
 
         return cost_colli
 
@@ -142,6 +132,20 @@ class SafetyLoss(nn.Module):
 
         pos = th.stack([x, y, z], dim=-1)
         return pos
+
+    def get_velocity_from_coeff(self, coe, t):
+        t_power = th.stack([th.ones_like(t), 2 * t, 3 * t ** 2, 4 * t ** 3, 5 * t ** 4], dim=-1).squeeze(-2)
+
+        coe_x = coe[:, 1:6]
+        coe_y = coe[:, 7:12]
+        coe_z = coe[:, 13:18]
+
+        vx = th.sum(t_power * coe_x.unsqueeze(1), dim=-1)
+        vy = th.sum(t_power * coe_y.unsqueeze(1), dim=-1)
+        vz = th.sum(t_power * coe_z.unsqueeze(1), dim=-1)
+
+        vel = th.stack([vx, vy, vz], dim=-1)
+        return vel
 
     def get_batch_sdf(self, pos, map_id):
         """

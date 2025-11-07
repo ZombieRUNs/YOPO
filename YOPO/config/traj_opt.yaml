@@ -10,7 +10,7 @@ acc_max_train: 6.0
 wg: 0.12   # guidance
 ws: 10.0   # smoothness
 wa: 1.0    # acceleration
-wc: 0.1    # collision
+wc: 1.0    # collision
 
 # dataset: set image_size = primitive_num × downsampling_factor (×32 for ResNet-18) in each axis
 dataset_path: "../dataset"

@@ -84,9 +84,9 @@ class YOPOLoss(nn.Module):
         """
         vel_scale = cfg["vel_max_train"] / 1.0
         self.smoothness_weight = cfg["ws"] / vel_scale ** 5
-        self.safety_weight = cfg["wc"] * vel_scale
-        self.goal_weight = cfg["wg"]
         self.accele_weight = cfg["wa"] / vel_scale ** 3
+        self.safety_weight = cfg["wc"]
+        self.goal_weight = cfg["wg"]
 
     def forward(self, state, prediction, goal, map_id):
         """
