@@ -82,13 +82,13 @@ class YopoTrainer:
     def train_one_epoch(self, epoch: int, total_progress):
         one_epoch_progress = self.progress_log.add_task(f"Epoch: {epoch}", total=len(self.train_dataloader))
         inspect_interval = max(1, len(self.train_dataloader) // 16)
-        traj_losses, score_losses, smooth_losses, safety_losses, goal_losses, start_time = [], [], [], [], [], time.time()
+        traj_losses, score_losses, smooth_losses, safety_losses, goal_losses, acc_losses, start_time = [], [], [], [], [], [], time.time()
         for step, (depth, pos, rot, obs_b, map_id) in enumerate(self.train_dataloader):  # obs: body frame
             if depth.shape[0] != self.batch_size:  continue  # batch size == number of env
 
             self.optimizer.zero_grad()
 
-            trajectory_loss, score_loss, smooth_cost, safety_cost, goal_cost = self.forward_and_compute_loss(depth, pos, rot, obs_b, map_id)
+            trajectory_loss, score_loss, smooth_cost, safety_cost, goal_cost, acc_cost = self.forward_and_compute_loss(depth, pos, rot, obs_b, map_id)
 
             loss = self.loss_weight[0] * trajectory_loss + self.loss_weight[1] * score_loss
 
@@ -101,6 +101,7 @@ class YopoTrainer:
             smooth_losses.append(self.loss_weight[0] * smooth_cost.item())
             safety_losses.append(self.loss_weight[0] * safety_cost.item())
             goal_losses.append(self.loss_weight[0] * goal_cost.item())
+            acc_losses.append(self.loss_weight[0] * acc_cost.item())
 
             if step % inspect_interval == inspect_interval - 1:
                 batch_fps = inspect_interval / (time.time() - start_time)
@@ -112,7 +113,8 @@ class YopoTrainer:
                 self.tensorboard_log.add_scalar("Detail/SmoothLoss", np.mean(smooth_losses), epoch * len(self.train_dataloader) + step)
                 self.tensorboard_log.add_scalar("Detail/SafetyLoss", np.mean(safety_losses), epoch * len(self.train_dataloader) + step)
                 self.tensorboard_log.add_scalar("Detail/GoalLoss", np.mean(goal_losses), epoch * len(self.train_dataloader) + step)
-                traj_losses, score_losses, smooth_losses, safety_losses, goal_losses, start_time = [], [], [], [], [], time.time()
+                self.tensorboard_log.add_scalar("Detail/AccelLoss", np.mean(acc_losses), epoch * len(self.train_dataloader) + step)
+                traj_losses, score_losses, smooth_losses, safety_losses, goal_losses, acc_losses, start_time = [], [], [], [], [], [], time.time()
 
             self.progress_log.update(one_epoch_progress, advance=1)
             self.progress_log.update(total_progress, advance=1 / len(self.train_dataloader))
@@ -126,7 +128,7 @@ class YopoTrainer:
         for step, (depth, pos, rot, obs_b, map_id) in enumerate(self.val_dataloader):  # obs: body frame
             if depth.shape[0] != self.batch_size:  continue  # batch size == num of env
 
-            trajectory_loss, score_loss, _, _, _ = self.forward_and_compute_loss(depth, pos, rot, obs_b, map_id)
+            trajectory_loss, score_loss, _, _, _, _ = self.forward_and_compute_loss(depth, pos, rot, obs_b, map_id)
 
             traj_losses.append(self.loss_weight[0] * trajectory_loss.item())
             score_losses.append(self.loss_weight[1] * score_loss.item())
@@ -166,12 +168,12 @@ class YopoTrainer:
         # [B*V*H, 3, 3]: [px, py, pz; vx, vy, vz; ax, ay, az]
         end_state_w = torch.stack([end_pos_w, end_vel_w, end_acc_w], dim=1)
 
-        smooth_cost, safety_cost, goal_cost = self.yopo_loss(start_state_w, end_state_w, goal_w, map_id)
-        trajectory_loss = (smooth_cost + safety_cost + goal_cost).mean()
+        smooth_cost, safety_cost, goal_cost, acc_cost = self.yopo_loss(start_state_w, end_state_w, goal_w, map_id)
+        trajectory_loss = (smooth_cost + safety_cost + goal_cost + acc_cost).mean()
 
-        score_label = (smooth_cost + safety_cost + goal_cost).clone().detach()
+        score_label = (smooth_cost + safety_cost + goal_cost + acc_cost).clone().detach()
         score_loss = F.smooth_l1_loss(score_flat, score_label)
-        return trajectory_loss, score_loss, smooth_cost.mean(), safety_cost.mean(), goal_cost.mean()
+        return trajectory_loss, score_loss, smooth_cost.mean(), safety_cost.mean(), goal_cost.mean(), acc_cost.mean()
 
     def save_model(self):
         if hasattr(self, "epoch_i"):
