@@ -86,16 +86,20 @@ class YOPODataset(Dataset):
         image = cv2.imread(self.img_list[item], -1).astype(np.float32)
         image = np.expand_dims(cv2.resize(image, (self.width, self.height), interpolation=cv2.INTER_NEAREST) / 65535.0, axis=0)
 
-        # 2. get random vel, acc
-        vel_b, acc_b = self._get_random_state()
-
-        # 3. generate random goal in front of the quadrotor.
+        # W: world frame; B/b: body frame
+        # w: level with the ground but with the same orientation (yaw) as the body frame
         q_wxyz = self.quaternions[item, :]  # q: wxyz
         R_WB = R.from_quat([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]])
         euler_angles = R_WB.as_euler('ZYX', degrees=False)  # [yaw(z) pitch(y) roll(x)]
-        R_wB = R.from_euler('ZYX', [0, euler_angles[1], euler_angles[2]], degrees=False)
+        R_Bw = R.from_euler('ZYX', [0, euler_angles[1], euler_angles[2]], degrees=False).inv()
+
+        # 2. get random vel, acc in the direction of the quadrotor
+        vel_w, acc_w = self._get_random_state()
+        vel_b, acc_b = R_Bw.apply(vel_w), R_Bw.apply(acc_w)
+
+        # 3. generate random goal in front of the quadrotor
         goal_w = self._get_random_goal()
-        goal_b = R_wB.inv().apply(goal_w)
+        goal_b = R_Bw.apply(goal_w)
 
         random_obs = np.hstack((vel_b, acc_b, goal_b)).astype(np.float32)
         rot_wb = R_WB.as_matrix().astype(np.float32)  # transform to rot_matrix in numpy is faster than using quat in pytorch
