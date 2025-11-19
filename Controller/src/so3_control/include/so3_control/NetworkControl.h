@@ -110,11 +110,11 @@ private:
 
     void recordLog(Eigen::Vector3d &cur_v, Eigen::Vector3d &cur_a, Eigen::Vector3d &des_a, Eigen::Vector3d &dis_a, double cur_yaw, double des_yaw);
 
-    Eigen::Vector3d publishHoverSO3Command(Eigen::Vector3d des_pos_, Eigen::Vector3d des_vel_, Eigen::Vector3d des_acc_, double des_yaw_, double des_yaw_dot_);
+    Eigen::Vector3d publishHoverSO3Command(Eigen::Vector3d des_pos, Eigen::Vector3d des_vel, Eigen::Vector3d des_acc, double des_yaw, double des_yaw_dot);
 
-    void get_Q_from_ACC(const Eigen::Vector3d &ref_acc, double ref_yaw, Eigen::Quaterniond &quat_des, Eigen::Vector3d &force_des);
+    Eigen::Vector3d get_Q_from_ACC(const Eigen::Vector3d &ref_acc, double ref_yaw, Eigen::Quaterniond &quat_des, Eigen::Vector3d &force_des);
 
-    void pub_SO3_command(Eigen::Vector3d ref_acc, double ref_yaw, double cur_yaw);
+    Eigen::Vector3d pub_SO3_command(Eigen::Vector3d ref_acc, double ref_yaw, double cur_yaw);
 
     void limite_acc(Eigen::Vector3d &acc);
 

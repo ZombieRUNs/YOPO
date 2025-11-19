@@ -282,6 +282,7 @@ main(int argc, char** argv)
   ros::Time next_odom_pub_time = ros::Time::now();
   while (n.ok())
   {
+    ros::Time t_loop_start = ros::Time::now();
     ros::spinOnce();
 
     auto last = control;
@@ -317,6 +318,10 @@ main(int argc, char** argv)
       }
     }
 
+    double loop_time = (ros::Time::now() - t_loop_start).toSec();
+
+    if (loop_time > dt)
+        ROS_WARN("Simulator loop overrun: loop_time = %.2f ms > expected %.2f ms!", loop_time * 1000.0, dt * 1000.0);
     r.sleep();
   }
 

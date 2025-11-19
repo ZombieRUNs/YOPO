@@ -150,7 +150,7 @@ Eigen::Vector3d NetworkControl::publishHoverSO3Command(Eigen::Vector3d des_pos, 
     return att_acc;
 }
 
-void NetworkControl::get_Q_from_ACC(const Eigen::Vector3d &ref_acc, double ref_yaw, Eigen::Quaterniond &quat_des, Eigen::Vector3d &force_des)
+Eigen::Vector3d NetworkControl::get_Q_from_ACC(const Eigen::Vector3d &ref_acc, double ref_yaw, Eigen::Quaterniond &quat_des, Eigen::Vector3d &force_des)
 {
     Eigen::Vector3d force_ = mass_ * ONE_G * Eigen::Vector3d(0, 0, 1);
     force_.noalias() += mass_ * ref_acc;
@@ -187,14 +187,16 @@ void NetworkControl::get_Q_from_ACC(const Eigen::Vector3d &ref_acc, double ref_y
     quat_des = Eigen::Quaterniond(R);
     force_des = force_;
 
+    Eigen::Vector3d acc_actual = force_des / mass_ - Eigen::Vector3d(0, 0, ONE_G);
+    return acc_actual;
 }
 
 // 世界系的期望加速度：ref_acc（加上g）、期望yaw：ref_yaw
-void NetworkControl::pub_SO3_command(Eigen::Vector3d ref_acc, double ref_yaw, double cur_yaw)
+Eigen::Vector3d NetworkControl::pub_SO3_command(Eigen::Vector3d ref_acc, double ref_yaw, double cur_yaw)
 {
     Eigen::Vector3d force;
     Eigen::Quaterniond quat_des;
-    get_Q_from_ACC(ref_acc, ref_yaw, quat_des, force);
+    Eigen::Vector3d acc_actual = get_Q_from_ACC(ref_acc, ref_yaw, quat_des, force);
     quadrotor_msgs::SO3Command::Ptr so3_command(new quadrotor_msgs::SO3Command);
     so3_command->header.stamp = ros::Time::now();
     so3_command->force.x = force(0);
@@ -217,13 +219,16 @@ void NetworkControl::pub_SO3_command(Eigen::Vector3d ref_acc, double ref_yaw, do
     double thrust_norm = force.norm() / (mass_ * ONE_G) * hover_thrust_;
     mavros_interface_.pub_att_thrust_cmd(quat_des, thrust_norm);
     last_thrust_ = thrust_norm;
+    return acc_actual;
 }
 
 void NetworkControl::limite_acc(Eigen::Vector3d &acc){
-    return;  // limited if needed
-    acc[0] = std::max(-8.0, std::min(acc[0], 8.0));
-    acc[1] = std::max(-8.0, std::min(acc[1], 8.0));
-    acc[2] = std::max(-4.0, std::min(acc[2], 4.0));
+    return;
+    double max_norm = 10.0;
+    double norm = acc.norm();
+    if (norm > max_norm) {
+        acc = acc / norm * max_norm;
+    }
 }
 
 void NetworkControl::network_cmd_callback(const quadrotor_msgs::PositionCommand::ConstPtr &cmd)
@@ -239,6 +244,8 @@ void NetworkControl::network_cmd_callback(const quadrotor_msgs::PositionCommand:
 
     position_cmd_init_ = true;
 
+    des_pos_ = Eigen::Vector3d(cmd->position.x, cmd->position.y, cmd->position.z);
+    des_vel_ = Eigen::Vector3d(cmd->velocity.x, cmd->velocity.y, cmd->velocity.z);
     Eigen::Vector3d des_acc = Eigen::Vector3d(cmd->acceleration.x, cmd->acceleration.y, cmd->acceleration.z);
     limite_acc(des_acc);
 
@@ -255,18 +262,15 @@ void NetworkControl::network_cmd_callback(const quadrotor_msgs::PositionCommand:
             att_acc = des_acc - dis_acc_;
         else
             att_acc = des_acc;
-        pub_SO3_command(att_acc, des_yaw, cur_yaw_);
+        att_acc = pub_SO3_command(att_acc, des_yaw, cur_yaw_);
         // std::cout<<"acc: "<<des_acc.transpose()<<"   yaw:"<<des_yaw<<std::endl;
         if (record_log_)
             recordLog(cur_vel_, cur_acc_, des_acc, dis_acc_, cur_yaw_, des_yaw);
     }
     else
     {
-        Eigen::Vector3d des_pos = Eigen::Vector3d(cmd->position.x, cmd->position.y, cmd->position.z);
-        Eigen::Vector3d des_vel = Eigen::Vector3d(cmd->velocity.x, cmd->velocity.y, cmd->velocity.z);
-        double des_yaw = cmd->yaw;
         double des_yaw_dot = cmd->yaw_dot;
-        att_acc = publishHoverSO3Command(des_pos, des_vel, des_acc, des_yaw, des_yaw_dot);
+        att_acc = publishHoverSO3Command(des_pos_, des_vel_, des_acc, des_yaw, des_yaw_dot);
         if (record_log_)
             recordLog(cur_vel_, cur_acc_, att_acc, dis_acc_, cur_yaw_, des_yaw);
     }
@@ -345,6 +349,7 @@ void NetworkControl::takeoff_land_thread(quadrotor_msgs::SetTakeoffLand::Request
     float takeoff_altitude = req.takeoff_altitude;
     des_pos_ = cur_pos_;
     des_pos_(2) -= 0.2;
+    des_vel_ = Eigen::Vector3d(0, 0, 0);
     des_yaw_ = cur_yaw_;
     mutex_.unlock();
     ref_valid_ = true;
