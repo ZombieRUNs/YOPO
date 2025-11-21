@@ -7,10 +7,10 @@ vel_max_train: 6.0
 acc_max_train: 6.0
 
 # IMPORTANT: weight of costs for unit speed (can be visualized in tensorboard)
-wg: 0.12   # guidance
-ws: 10.0   # smoothness
-wa: 1.0    # acceleration
-wc: 1.0    # collision
+wg: 0.12   # guidance     (approaching the goal)
+ws: 10.0   # smoothness   (smaller jerk)
+wa: 1.0    # acceleration (smaller acceleration)
+wc: 1.0    # collision    (distance to obstacle)
 
 # dataset: set image_size = primitive_num × downsampling_factor (×32 for ResNet-18) in each axis
 dataset_path: "../dataset"

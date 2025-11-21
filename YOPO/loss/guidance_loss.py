@@ -22,13 +22,16 @@ class GuidanceLoss(nn.Module):
         """
         cur_pos = Df[:, :, 0]
         end_pos = Dp[:, :, 0]
+        end_vel = Dp[:, :, 1]
 
         traj_dir = end_pos - cur_pos  # [B, 3]
         goal_dir = goal - cur_pos  # [B, 3]
 
         guidance_loss = self.distance_loss(traj_dir, goal_dir)
         # guidance_loss = self.similarity_loss(traj_dir, goal_dir)
-        return guidance_loss
+
+        # vel_dir_loss = self.derivative_similarity_loss(end_vel, goal_dir)
+        return guidance_loss # + 5 * vel_dir_loss
 
     def distance_loss(self, traj_dir, goal_dir):
         """
@@ -69,3 +72,13 @@ class GuidanceLoss(nn.Module):
         perp_weight = 0.5   # the given weight is trained with perp_weight = 0, for higher speed in large-scale scenario
         similarity_loss = parallel_diff + perp_weight * perp_diff
         return similarity_loss
+
+    def derivative_similarity_loss(self, derivative, goal_dir):
+        """
+            Constrain the velocity direction toward the goal
+        """
+        goal_dir_norm = goal_dir / (goal_dir.norm(dim=1, keepdim=True) + 1e-8)  # [B, 3]
+        derivative_norm = derivative / (derivative.norm(dim=1, keepdim=True) + 1e-8)  # [B, 3]
+
+        similarity = (derivative_norm * goal_dir_norm).sum(dim=1)  # [B]
+        return 1 - similarity
