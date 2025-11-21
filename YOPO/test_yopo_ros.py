@@ -35,7 +35,6 @@ class YopoNet:
         self.height = cfg['image_height']
         self.width = cfg['image_width']
         self.min_dis, self.max_dis = 0.04, 20.0
-        self.scale = {'435': 0.001, 'simulation': 1.0}.get(self.config['env'], 1.0)
         self.goal = np.array(self.config['goal'])
         self.plan_from_reference = self.config['plan_from_reference']
         self.use_trt = self.config['use_tensorrt']
@@ -147,15 +146,18 @@ class YopoNet:
     def callback_depth(self, data):
         if not self.odom_init: return
 
-        # 1. Depth Image Process
+        # 1. Depth Image Process (Be careful with the depth units in your application)
         time0 = time.time()
-        # depth = self.bridge.imgmsg_to_cv2(data, "32FC1")
-        assert data.encoding == "32FC1", f"Expected encoding '32FC1', got {data.encoding}"
-        depth = np.frombuffer(data.data, dtype=np.float32).reshape(data.height, data.width)
+        if data.encoding == "32FC1":    # Simulator, meter
+            depth = np.frombuffer(data.data, dtype=np.float32).reshape(data.height, data.width)
+        elif data.encoding == "16UC1":  # RealSense, millimeter
+            depth = np.frombuffer(data.data, dtype=np.uint16).reshape(data.height, data.width).astype(np.float32) / 1000.0
+        else:
+            raise ValueError(f"Unsupported depth encoding: {data.encoding}. Expected '32FC1' or '16UC1'.")
 
         if depth.shape[0] != self.height or depth.shape[1] != self.width:
             depth = cv2.resize(depth, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
-        depth = np.minimum(depth * self.scale, self.max_dis) / self.max_dis
+        depth = np.minimum(depth, self.max_dis) / self.max_dis
 
         # interpolated the nan value (experiment shows that treating nan directly as 0 produces similar results)
         nan_mask = np.isnan(depth) | (depth < self.min_dis / self.max_dis)
@@ -374,7 +376,6 @@ if __name__ == "__main__":
 
     settings = {'use_tensorrt': args.use_tensorrt,
                 'goal': [50, 0, 2],      # 目标点位置
-                'env': 'simulation',     # 深度图来源 ('435' or 'simulation', 和深度单位有关)
                 'pitch_angle_deg': -0,   # 相机俯仰角(仰为负)
                 'odom_topic': '/sim/odom',                   # 里程计话题
                 'depth_topic': '/depth_image',               # 深度图话题
