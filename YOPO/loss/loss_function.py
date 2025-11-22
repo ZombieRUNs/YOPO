@@ -104,15 +104,8 @@ class YOPOLoss(nn.Module):
         # Decision parameters (local frame) → (batch_size, 3, 3) [px, vx, ax; py, vy, ay; pz, vz, az]
         Dp = prediction.permute(0, 2, 1)
 
-        smoothness_cost = th.tensor(0.0, device=self.device, requires_grad=True)
-        safety_cost = th.tensor(0.0, device=self.device, requires_grad=True)
-        goal_cost = th.tensor(0.0, device=self.device, requires_grad=True)
-
-        if self.smoothness_weight > 0:
-            smoothness_cost, acceleration_cost = self.smoothness_loss(Df, Dp)
-        if self.safety_weight > 0:
-            safety_cost = self.safety_loss(Df, Dp, map_id)
-        if self.goal_weight > 0:
-            goal_cost = self.goal_loss(Df, Dp, goal)
+        smoothness_cost, acceleration_cost = self.smoothness_loss(Df, Dp)
+        safety_cost = self.safety_loss(Df, Dp, map_id)
+        goal_cost = self.goal_loss(Df, Dp, goal)
 
         return self.smoothness_weight * smoothness_cost, self.safety_weight * safety_cost, self.goal_weight * goal_cost, self.accele_weight * acceleration_cost

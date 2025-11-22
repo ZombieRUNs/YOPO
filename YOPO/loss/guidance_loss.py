@@ -8,6 +8,7 @@ class GuidanceLoss(nn.Module):
     def __init__(self):
         super(GuidanceLoss, self).__init__()
         self.goal_length = cfg['goal_length']
+        self.vel_dir_weight = 0  # 5
 
     def forward(self, Df, Dp, goal):
         """
@@ -27,11 +28,13 @@ class GuidanceLoss(nn.Module):
         traj_dir = end_pos - cur_pos  # [B, 3]
         goal_dir = goal - cur_pos  # [B, 3]
 
-        guidance_loss = self.distance_loss(traj_dir, goal_dir)
-        # guidance_loss = self.similarity_loss(traj_dir, goal_dir)
+        # guidance_loss = self.distance_loss(traj_dir, goal_dir)
+        guidance_loss = self.similarity_loss(traj_dir, goal_dir)
 
-        # vel_dir_loss = self.derivative_similarity_loss(end_vel, goal_dir)
-        return guidance_loss # + 5 * vel_dir_loss
+        if self.vel_dir_weight > 0:
+            vel_dir_loss = self.derivative_similarity_loss(end_vel, goal_dir)
+            guidance_loss += self.vel_dir_weight * vel_dir_loss
+        return guidance_loss
 
     def distance_loss(self, traj_dir, goal_dir):
         """
@@ -40,7 +43,7 @@ class GuidanceLoss(nn.Module):
 
         L1Loss: L1 distance (same scale as the similarity loss) to the normalized goal (for numerical stability).
                 closer to the goal is preferred.
-        Straighter flight, but slightly inferior to the similarity cost in flight speed.
+        Straighter flight and more precise near the goal, but slightly inferior in flight speed.
         """
         l1_distance = F.smooth_l1_loss(traj_dir, goal_dir, reduction='none')  # shape: (B, 3)
         l1_distance = l1_distance.sum(dim=1)  # (B)
@@ -53,7 +56,8 @@ class GuidanceLoss(nn.Module):
 
         SimilarityLoss: Projection length of the trajectory onto the goal direction:
                         higher cosine similarity and longer trajectory are preferred.
-        Faster flight in large-scale scenario by allowing longer lateral avoidance without slowing down, but less precise near the goal.
+
+        Adjust perp_weight to penalize deviation perpendicular to the goal; equals the distance_loss() when perp_weight = 1.
         """
         goal_dir_norm = goal_dir / (goal_dir.norm(dim=1, keepdim=True) + 1e-8)  # [B, 3]
 

@@ -189,7 +189,7 @@ class YopoNet:
         endstate_c = endstate.reshape(-1, 3, 3).transpose(0, 2, 1)  # [N, 9] -> [N, 3, 3] -> [px vx ax, py vy ay, pz vz az]
         endstate_w = np.matmul(self.Rotation_wc, endstate_c)
 
-        action_id = np.argmin(score_pred) if self.visualize else 0
+        action_id = np.argmin(score) if self.visualize else 0
         with self.lock:  # Python3.8: threads are scheduled using time slices, add the lock to ensure safety
             start_pos = self.desire_pos if self.plan_from_reference else np.array((self.odom.pose.pose.position.x, self.odom.pose.pose.position.y, self.odom.pose.pose.position.z))
             start_vel = self.desire_vel if self.plan_from_reference else np.array((self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y, self.odom.twist.twist.linear.z))
