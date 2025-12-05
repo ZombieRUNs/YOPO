@@ -140,7 +140,7 @@ class YopoNet:
 
         obs = np.concatenate((vel_c, acc_c, goal_c), axis=0).astype(np.float32)
         obs_norm = self.state_transform.normalize_obs(torch.from_numpy(obs[None, :]))
-        return obs_norm.to(self.device, non_blocking=True)
+        return obs_norm
 
     @torch.inference_mode()
     def callback_depth(self, data):
@@ -171,9 +171,8 @@ class YopoNet:
         # input prepare
         time1 = time.time()
         depth_input = torch.from_numpy(depth).to(self.device, non_blocking=True)  # (non_blocking: copying speed 3x)
-        obs_norm = self.process_odom()
+        obs_norm = self.process_odom().to(self.device, non_blocking=True)
         obs_input = self.state_transform.prepare_input(obs_norm)
-        obs_input = obs_input.to(self.device, non_blocking=True)
         # torch.cuda.synchronize()
 
         time2 = time.time()

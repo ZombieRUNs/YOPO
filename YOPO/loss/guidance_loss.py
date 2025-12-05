@@ -66,7 +66,7 @@ class GuidanceLoss(nn.Module):
         goal_length = goal_dir.norm(dim=1)  # [B]
 
         # length difference along goal direction (cosine similarity)
-        parallel_diff = (goal_length - traj_along).abs()  # [B]
+        parallel_diff = F.smooth_l1_loss(goal_length, traj_along, reduction='none')
 
         # length perpendicular to goal direction
         traj_perp = traj_dir - traj_along.unsqueeze(1) * goal_dir_norm  # [B, 3]
