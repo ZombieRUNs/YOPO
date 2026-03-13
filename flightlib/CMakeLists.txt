@@ -109,7 +109,7 @@ if(NOT EXISTS ${CMAKE_BINARY_DIR}/CMakeCache.txt)
 	endif()
 endif()
 
-cuda_select_nvcc_arch_flags(CUDA_ARCH_FLAGS)
+set(CUDA_ARCH_FLAGS "-gencode arch=compute_75,code=sm_75 -gencode arch=compute_89,code=sm_89")
 message("CUDA Architecture: ${CUDA_ARCH_FLAGS}")
 
 if(${CMAKE_BUILD_TYPE} STREQUAL Release)

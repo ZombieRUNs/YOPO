@@ -1,0 +1,9 @@
+flightlib/build/
+flightlib/externals/
+flightrender/RPG_Flightmare/
+docker/
+.git/
+*.pyc
+__pycache__/
+run/yopo_sim/
+run/saved/

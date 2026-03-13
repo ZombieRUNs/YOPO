@@ -35,3 +35,8 @@ run/utils/*.csv
 /run/*.pth
 /run/*.rknn
 
+# build
+flightlib/build/
+
+# claude.md
+CLAUDE.md
