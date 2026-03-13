@@ -175,6 +175,7 @@ class YOPOContainer:
         print(f"[INFO] Entering container '{running}' ...\n")
         subprocess.run([
             "docker", "exec", "-it",
+            "--workdir", f"{self.CONTAINER_WORKSPACE}/YOPO/run",
             f"--env=DISPLAY={display}",
             running,
             "bash",
