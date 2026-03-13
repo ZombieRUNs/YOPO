@@ -33,6 +33,7 @@ import os
 import shutil
 
 import numpy as np
+from ruamel.yaml import YAML, RoundTripDumper, dump
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -140,11 +141,13 @@ def main(args):
     from flightgym import QuadrotorEnv_v1
     from flightpolicy.envs import vec_env_wrapper as wrapper
 
-    # Flightmare environment — QuadrotorEnv_v1 expects YAML content string
+    # Flightmare environment — QuadrotorEnv_v1 expects ruamel.yaml-dumped string
     vec_cfg_path = os.path.join(CFG_PATH, "vec_env.yaml")
-    with open(vec_cfg_path, "r") as f:
-        vec_cfg_str = f.read()
-    env = wrapper.FlightEnvVec(QuadrotorEnv_v1(vec_cfg_str, False))
+    cfg = YAML().load(open(vec_cfg_path, "r"))
+    cfg["env"]["num_envs"] = 1
+    cfg["env"]["num_threads"] = 1
+    cfg["env"]["render"] = "yes"
+    env = wrapper.FlightEnvVec(QuadrotorEnv_v1(dump(cfg, Dumper=RoundTripDumper), False))
     env.connectUnity()
 
     # GCOPTER planner
