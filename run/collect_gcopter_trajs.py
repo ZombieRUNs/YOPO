@@ -19,7 +19,7 @@ Output layout:
         coeffs.npy       [N*3, 6]  float64 (descending: col0=t^5, col5=const)
         durations.npy    [N]       float64
         waypoints.npy    [M, 13]   float32  [t,px,py,pz,vx,vy,vz,ax,ay,az,jx,jy,jz]
-        depths.npy       [M,90,160] float16  (0..1 normalised, 20m clip)
+        depths.npy       [M,96,160] float16  (0..1 normalised, 20m clip)
         start_pva.npy    [3, 3]
         goal_pva.npy     [3, 3]
       traj_0001/
@@ -53,7 +53,7 @@ DILATE_R = 0.5       # metres
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FLIGHTMARE_PATH = os.environ.get("FLIGHTMARE_PATH",
                                   os.path.dirname(_SCRIPT_DIR))
-PLY_DIR = os.path.join(FLIGHTMARE_PATH, "flightlib", "run", "yopo_sim")
+PLY_DIR = os.path.join(FLIGHTMARE_PATH, "run", "yopo_sim")
 CFG_PATH = os.path.join(FLIGHTMARE_PATH, "flightlib", "configs")
 
 
@@ -81,13 +81,16 @@ def obs_to_world_pva(obs):
     return pos, vel, acc
 
 
-def sample_pair(env, min_d, max_d, max_tries=300):
-    """Sample a collision-free (start, goal) pair with distance in [min_d, max_d]."""
+def sample_pair(env, planner, min_d, max_d, max_tries=300):
+    """Sample a start/goal pair that is free in both Flightmare and GCOPTER map."""
     for _ in range(max_tries):
         obs_s = env.reset()
         sp, sv, sa = obs_to_world_pva(obs_s)
         obs_g = env.reset()
         gp, gv, ga = obs_to_world_pva(obs_g)
+        # Enforce non-overlap with point cloud / dilated occupancy before planning.
+        if (not planner.isFree(sp)) or (not planner.isFree(gp)):
+            continue
         if min_d < np.linalg.norm(gp - sp) < max_d:
             # Use zero boundary conditions for clean start/stop
             return (sp, np.zeros(3), np.zeros(3),
@@ -105,10 +108,11 @@ def collect_depths(env, flatmap, waypoints):
         waypoints:  ndarray [M, 13]
 
     Returns:
-        depths: ndarray [M, 90, 160] float16, normalised to [0, 1]
+        depths: ndarray [M, 96, 160] float16, normalised to [0, 1]
+                (normalisation is done by vec_env_wrapper.getDepthImage)
     """
     M = len(waypoints)
-    depths = np.zeros((M, 90, 160), dtype=np.float16)
+    depths = np.zeros((M, 96, 160), dtype=np.float16)
 
     for k in range(M):
         t, px, py, pz, vx, vy, vz, ax, ay, az, jx, jy, jz = waypoints[k]
@@ -116,17 +120,21 @@ def collect_depths(env, flatmap, waypoints):
         acc = np.array([ax, ay, az])
         jer = np.array([jx, jy, jz])
 
-        # Yaw = direction of flight
-        psi = math.atan2(vy, vx)
-        _thr, quat, _omg = flatmap.forward(vel, acc, jer, psi, 0.0)
+        # Yaw = direction of flight; identity quat when near-hover
+        speed = math.sqrt(vx*vx + vy*vy + vz*vz)
+        if speed < 1e-3:
+            quat = np.array([1.0, 0.0, 0.0, 0.0])
+        else:
+            psi = math.atan2(vy, vx)
+            _thr, quat, _omg = flatmap.forward(vel, acc, jer, psi, 0.0)
+            quat = np.array(quat)
 
-        # setState expects [pos(3), vel_world(3), acc_world(3), quat(4)]
-        state = np.concatenate([[px, py, pz], vel, acc, quat])
-        env.setState(state)
+        # setState sets C++ state; render() syncs with Unity and fills image buffer
+        env.setState(np.array([px, py, pz]), vel, acc, quat)
+        env.render()
 
-        depth = env.getDepthImage()[0]       # [90, 160] float32, metres
-        depth = np.clip(depth, 0.0, 20.0) / 20.0
-        depth[np.isnan(depth)] = 1.0
+        # getDepthImage() returns [num_envs, 1, net_h, net_w], already normalised [0,1]
+        depth = env.getDepthImage()[0][0]   # → [96, 160]
         depths[k] = depth.astype(np.float16)
 
     return depths
@@ -146,9 +154,21 @@ def main(args):
     cfg = YAML().load(open(vec_cfg_path, "r"))
     cfg["env"]["num_envs"] = 1
     cfg["env"]["num_threads"] = 1
-    cfg["env"]["render"] = "yes"
+    cfg["env"]["render"] = True
+    cfg["env"]["supervised"] = False
+    cfg["env"]["imitation"] = False
+    os.system(FLIGHTMARE_PATH + "/flightrender/RPG_Flightmare/flightmare.x86_64 &")
     env = wrapper.FlightEnvVec(QuadrotorEnv_v1(dump(cfg, Dumper=RoundTripDumper), False))
     env.connectUnity()
+
+    # Use Flightmare world box as GCOPTER map bound
+    # env.world_box = [x_min, y_min, z_min, x_max, y_max, z_max]
+    wb = env.world_box
+    map_bound = [float(wb[0]), float(wb[3]),   # xmin, xmax
+                 float(wb[1]), float(wb[4]),   # ymin, ymax
+                 max(0.0, float(wb[2])),        # zmin (floor at 0)
+                 min(8.0, float(wb[5]))]        # zmax (cap at 8 m)
+    print(f"[INFO] world_box={wb}  map_bound={map_bound}", flush=True)
 
     # GCOPTER planner
     planner_cfg = os.path.join(CFG_PATH, "gcopter_config.yaml")
@@ -166,19 +186,22 @@ def main(args):
         "total_scenes": args.num_scenes,
         "total_trajectories": 0,
         "dt": DT,
-        "img_shape": [90, 160],
+        "img_shape": [96, 160],
         "img_range": "0-1 normalised, 20m clip",
         "scenes": [],
     }
 
     for scene_id in range(args.num_scenes):
         # Generate scene + export PLY
+        print(f"[scene {scene_id}] spawnTrees", flush=True)
         env.setMapID(np.array([scene_id]))
         env.spawnTreesAndSavePointcloud(scene_id, spacing=4.0)
         ply_src = os.path.join(PLY_DIR, f"pointcloud-{scene_id}.ply")
 
         # Load into GCOPTER VoxelMap
-        planner.loadScene(ply_src, MAP_BOUND, VOXEL_WIDTH, DILATE_R)
+        print(f"[scene {scene_id}] loadScene", flush=True)
+        planner.loadScene(ply_src, map_bound, VOXEL_WIDTH, DILATE_R)
+        print(f"[scene {scene_id}] loadScene done", flush=True)
 
         scene_dir = os.path.join(save_root, f"scene_{scene_id:03d}")
         os.makedirs(scene_dir, exist_ok=True)
@@ -193,15 +216,17 @@ def main(args):
         while traj_count < args.trajs_per_scene and attempts < max_attempts:
             attempts += 1
 
-            pair = sample_pair(env, MIN_DIST, MAX_DIST)
+            pair = sample_pair(env, planner, MIN_DIST, MAX_DIST)
             if pair is None:
                 continue
 
             sp, sv, sa, gp, gv, ga = pair
+            print(f"[scene {scene_id}] plan attempt {attempts}: {sp} -> {gp}", flush=True)
             result = planner.plan(
                 sp, sv, sa,
                 gp, gv, ga,
             )
+            print(f"[scene {scene_id}] plan done: success={result['success']}", flush=True)
 
             if not result["success"]:
                 continue
@@ -236,7 +261,7 @@ def main(args):
             traj_count += 1
 
         index["scenes"].append(
-            {"scene_id": scene_id, "num_trajs": traj_count, "map_bound": MAP_BOUND}
+            {"scene_id": scene_id, "num_trajs": traj_count, "map_bound": map_bound}
         )
         index["total_trajectories"] += traj_count
         print(f"Scene {scene_id:3d}: {traj_count}/{args.trajs_per_scene} trajectories "

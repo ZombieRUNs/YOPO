@@ -32,6 +32,11 @@ Args:
     dilate_radius: Safety margin in metres (default 0.5).
 )")
 
+        .def("isFree",
+             &gcplanner::GcopterPlanner::isFree,
+             py::arg("pos"),
+             "Return true iff a position is free in the dilated voxel map.")
+
         .def("plan",
              [](gcplanner::GcopterPlanner& planner,
                 const Eigen::Vector3d& start_pos,

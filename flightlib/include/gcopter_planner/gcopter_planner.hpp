@@ -61,6 +61,9 @@ class GcopterPlanner {
                     const Eigen::Vector3d& goal_vel,
                     const Eigen::Vector3d& goal_acc) const;
 
+    // Return true iff pos is free in the current (dilated) voxel map.
+    bool isFree(const Eigen::Vector3d& pos) const;
+
     const PlanConfig& getConfig() const { return config_; }
 
    private:

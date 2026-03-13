@@ -1,5 +1,7 @@
 #include "gcopter_planner/gcopter_planner.hpp"
 
+#include <chrono>
+#include <iostream>
 #include <stdexcept>
 
 #include <yaml-cpp/yaml.h>
@@ -90,6 +92,13 @@ void GcopterPlanner::loadScene(const std::string& ply_path,
     map_->dilate(dilate_voxels);
 }
 
+bool GcopterPlanner::isFree(const Eigen::Vector3d& pos) const {
+    if (!map_) {
+        return false;
+    }
+    return !map_->query(pos);
+}
+
 // ---------------------------------------------------------------------------
 // Planning
 // ---------------------------------------------------------------------------
@@ -103,19 +112,59 @@ PlanResult GcopterPlanner::plan(const Eigen::Vector3d& start_pos,
     PlanResult result;
 
     if (!map_) {
+        std::cout << "[gcopter_planner] plan aborted: map not loaded" << std::endl;
         result.success = false;
+        return result;
+    }
+
+    const bool start_occupied = map_->query(start_pos);
+    const bool goal_occupied = map_->query(goal_pos);
+    std::cout << "[gcopter_planner] plan begin"
+              << " start=[" << start_pos.transpose() << "]"
+              << " goal=[" << goal_pos.transpose() << "]"
+              << " start_occ=" << static_cast<int>(start_occupied)
+              << " goal_occ=" << static_cast<int>(goal_occupied)
+              << std::endl;
+
+    // Skip invalid endpoint pairs early. This avoids feeding OMPL with invalid
+    // starts/goals and makes failure reason explicit in logs.
+    if (start_occupied || goal_occupied) {
+        std::cout << "[gcopter_planner] endpoint invalid -> skip"
+                  << " start_occ=" << static_cast<int>(start_occupied)
+                  << " goal_occ=" << static_cast<int>(goal_occupied)
+                  << std::endl;
         return result;
     }
 
     // 1. RRT* path planning
     std::vector<Eigen::Vector3d> route;
+    const auto t0 = std::chrono::steady_clock::now();
     double path_cost = sfc_gen::planPath<voxel_map::VoxelMap>(
         start_pos, goal_pos,
         map_->getOrigin(), map_->getCorner(),
         map_.get(), config_.rrt_timeout,
         route);
+    const auto t1 = std::chrono::steady_clock::now();
+    const auto rrt_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
-    if (std::isinf(path_cost)) return result;
+    // NOTE:
+    // In Release (-Ofast), finite-math assumptions may make isinf/isnan checks
+    // unreliable. Use route cardinality as hard success criterion.
+    const bool rrt_failed = route.size() < 2;
+    if (rrt_failed) {
+        std::cout << "[gcopter_planner] RRT failed"
+                  << " elapsed_ms=" << rrt_ms
+                  << " route_pts=" << route.size()
+                  << " path_cost=" << path_cost
+                  << " timeout_s=" << config_.rrt_timeout << std::endl;
+        return result;
+    }
+
+    std::cout << "[gcopter_planner] RRT success"
+              << " elapsed_ms=" << rrt_ms
+              << " route_pts=" << route.size()
+              << " path_cost=" << path_cost << std::endl;
 
     // 2. Surface points for corridor generation
     std::vector<Eigen::Vector3d> surf_pts;
@@ -123,12 +172,24 @@ PlanResult GcopterPlanner::plan(const Eigen::Vector3d& start_pos,
 
     // 3. Convex corridor (FIRI)
     std::vector<Eigen::MatrixX4d> h_polys;
+    const auto t2 = std::chrono::steady_clock::now();
     sfc_gen::convexCover(route, surf_pts,
                           map_->getOrigin(), map_->getCorner(),
                           7.0, 3.0, h_polys);
     sfc_gen::shortCut(h_polys);
+    const auto t3 = std::chrono::steady_clock::now();
+    const auto corridor_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
 
-    if (h_polys.empty()) return result;
+    std::cout << "[gcopter_planner] corridor built"
+              << " elapsed_ms=" << corridor_ms
+              << " surf_pts=" << surf_pts.size()
+              << " corridors=" << h_polys.size() << std::endl;
+
+    if (h_polys.empty()) {
+        std::cout << "[gcopter_planner] corridor empty -> skip optimize" << std::endl;
+        return result;
+    }
 
     // 4. Boundary conditions
     Eigen::Matrix3d ini_state, fin_state;
@@ -151,16 +212,46 @@ PlanResult GcopterPlanner::plan(const Eigen::Vector3d& start_pos,
                           config_.smoothing_eps,
                           config_.integral_res,
                           mag_bounds, pen_weights, phy_params))
+    {
+        std::cout << "[gcopter_planner] optimizer setup failed"
+                  << " corridors=" << h_polys.size() << std::endl;
         return result;
+    }
 
     // 6. Optimize
     Trajectory<5> traj;
-    if (std::isinf(optimizer.optimize(traj, config_.rel_cost_tol)))
+    const auto t4 = std::chrono::steady_clock::now();
+    const double opt_cost = optimizer.optimize(traj, config_.rel_cost_tol);
+    const auto t5 = std::chrono::steady_clock::now();
+    const auto opt_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(t5 - t4).count();
+
+    // NOTE:
+    // flightlib Release uses -Ofast; finite-math assumptions can make isinf/isnan
+    // checks unreliable. Use trajectory validity as the hard failure criterion.
+    const int piece_num = traj.getPieceNum();
+    const double total_T = traj.getTotalDuration();
+    const bool invalid_traj = (piece_num <= 0) || (total_T <= 0.0);
+    if (invalid_traj) {
+        std::cout << "[gcopter_planner] optimize failed"
+                  << " elapsed_ms=" << opt_ms
+                  << " rel_cost_tol=" << config_.rel_cost_tol
+                  << " integral_res=" << config_.integral_res
+                  << " cost=" << opt_cost
+                  << " pieces=" << piece_num
+                  << " total_T=" << total_T
+                  << std::endl;
         return result;
+    }
 
     // 7. Extract results
-    const int N = traj.getPieceNum();
-    const double T = traj.getTotalDuration();
+    const int N = piece_num;
+    const double T = total_T;
+    std::cout << "[gcopter_planner] optimize success"
+              << " elapsed_ms=" << opt_ms
+              << " cost=" << opt_cost
+              << " pieces=" << N
+              << " total_T=" << T << std::endl;
 
     result.success = true;
     result.total_duration = T;
