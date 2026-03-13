@@ -119,4 +119,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-noetic-rqt-plot \
     && rm -rf /var/lib/apt/lists/*
 
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libffi.so.7.1.0 /opt/conda/envs/yopo/lib/libffi.so.7
+
 CMD ["/bin/bash"]
