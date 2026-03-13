@@ -137,7 +137,7 @@ class YOPOContainer:
             # X11 forwarding
             "--mount", f"type=bind,source=/tmp/.X11-unix,target=/tmp/.X11-unix",
             "--mount", f"type=bind,source={xauth},target=/root/.Xauthority",
-            # mount the whole workspace (e.g. /home/wrq/workspace/collect)
+            # mount the whole workspace (e.g. /home/wrq/workspace/fm-gcopter-dataset)
             "--mount", f"type=bind,source={self.mount_dir},target={self.CONTAINER_WORKSPACE}",
             # environment
             f"--env=DISPLAY={display}",
@@ -208,7 +208,7 @@ class YOPOContainer:
 
 def main():
     project_dir = Path(__file__).resolve().parent.parent
-    default_mount = project_dir.parent  # /home/wrq/workspace/collect
+    default_mount = project_dir.parent  # /home/wrq/workspace/fm-gcopter-dataset
 
     parser = argparse.ArgumentParser(
         description="YOPO Docker management utility.",

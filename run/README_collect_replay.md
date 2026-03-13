@@ -2,7 +2,7 @@
 
 该文件保留运行目录相关的最小说明，完整流程文档已统一到仓库根目录：
 
-- `collect/README.md`
+- `fm-gcopter-dataset/README.md`
 
 ---
 
