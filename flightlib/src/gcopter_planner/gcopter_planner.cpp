@@ -8,6 +8,7 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
+#include <gcopter/geo_utils.hpp>
 #include <gcopter/gcopter.hpp>
 #include <gcopter/sfc_gen.hpp>
 #include <gcopter/trajectory.hpp>
