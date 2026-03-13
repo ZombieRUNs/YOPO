@@ -48,7 +48,10 @@ MAP_BOUND = [-25.0, 25.0, -25.0, 25.0, 0.0, 5.0]  # [xmin,xmax,ymin,ymax,zmin,zm
 VOXEL_WIDTH = 0.25   # metres
 DILATE_R = 0.5       # metres
 
-FLIGHTMARE_PATH = os.environ.get("FLIGHTMARE_PATH", "")
+# FLIGHTMARE_PATH defaults to the YOPO root (parent of this script's directory)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+FLIGHTMARE_PATH = os.environ.get("FLIGHTMARE_PATH",
+                                  os.path.dirname(_SCRIPT_DIR))
 PLY_DIR = os.path.join(FLIGHTMARE_PATH, "flightlib", "run", "yopo_sim")
 CFG_PATH = os.path.join(FLIGHTMARE_PATH, "flightlib", "configs")
 
@@ -137,9 +140,11 @@ def main(args):
     from flightgym import QuadrotorEnv_v1
     from flightpolicy.envs import vec_env_wrapper as wrapper
 
-    # Flightmare environment
-    vec_cfg = os.path.join(CFG_PATH, "vec_env.yaml")
-    env = wrapper.FlightEnvVec(QuadrotorEnv_v1(vec_cfg, False))
+    # Flightmare environment — QuadrotorEnv_v1 expects YAML content string
+    vec_cfg_path = os.path.join(CFG_PATH, "vec_env.yaml")
+    with open(vec_cfg_path, "r") as f:
+        vec_cfg_str = f.read()
+    env = wrapper.FlightEnvVec(QuadrotorEnv_v1(vec_cfg_str, False))
     env.connectUnity()
 
     # GCOPTER planner
