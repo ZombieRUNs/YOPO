@@ -62,6 +62,14 @@ include(cmake/yaml.cmake)
 find_package(OpenMP REQUIRED)
 find_package(CUDA REQUIRED)
 
+# OMPL (needed by gcopter_planner for RRT*)
+find_package(ompl QUIET)
+if(ompl_FOUND)
+	message(STATUS "OMPL found: ${OMPL_INCLUDE_DIRS}")
+else()
+	message(STATUS "OMPL not found — gcopter_planner module will not be built")
+endif()
+
 if(ENABLE_BLAS)
 	set(BLA_VENDOR "Generic")
 	find_package(BLAS REQUIRED)
@@ -252,6 +260,33 @@ if(FLIGHTLIB_GYM_SOURCES)
 	endif()
 
 	target_link_libraries(flightgym PRIVATE ${LIBRARY_NAME})
+endif()
+
+# gcopter_planner — standalone Pybind11 module (no CUDA dependency)
+if(ompl_FOUND)
+	set(GCOPTER_INCLUDE ${CMAKE_SOURCE_DIR}/../../ROS/src/GCOPTER/gcopter/include)
+
+	pybind11_add_module(gcopter_planner MODULE
+		src/gcopter_planner/gcopter_planner.cpp
+		src/gcopter_planner/gcopter_planner_bind.cpp
+	)
+
+	target_include_directories(gcopter_planner PRIVATE
+		${PYBIND11_INCLUDE_DIR}
+		${PROJECT_SOURCE_DIR}/include
+		${EIGEN3_INCLUDE_DIR}
+		${PCL_INCLUDE_DIRS}
+		${OMPL_INCLUDE_DIRS}
+		${GCOPTER_INCLUDE}
+	)
+
+	target_link_libraries(gcopter_planner PRIVATE
+		${PCL_LIBRARIES}
+		${OMPL_LIBRARIES}
+		yaml-cpp
+	)
+
+	message(STATUS "gcopter_planner module enabled")
 endif()
 
 if(ENABLE_BLAS AND BLAS_FOUND AND LAPACK_FOUND)

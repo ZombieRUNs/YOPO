@@ -1,0 +1,32 @@
+# GCOPTER planner configuration
+# Parameters mirror global_planning.yaml from ZJU-FAST-Lab/GCOPTER
+
+# RRT* path planning
+TimeoutRRT:         0.1       # RRT* timeout in seconds
+
+# Trajectory optimizer
+WeightT:            20.0      # Time-cost weight rho
+SmoothingEps:       1.0e-2    # Smoothness epsilon
+IntegralIntervs:    16        # Quadrature resolution
+RelCostTol:         1.0e-5    # Relative cost convergence tolerance
+
+# Magnitude bounds: [v_max (m/s), omg_max (rad/s), theta_max (rad), thrust_min (N), thrust_max (N)]
+MaxVelMag:          4.0
+MaxBdrMag:          2.1
+MaxTiltAngle:       1.05
+MinThrust:          2.0
+MaxThrust:          12.0
+
+# Penalty weights: [pos, vel, omg, theta, thrust]
+ChiVec:             [1.0e+4, 1.0e+4, 1.0e+4, 1.0e+4, 1.0e+5]
+
+# Physical parameters
+VehicleMass:        0.61      # kg
+GravAcc:            9.8       # m/s^2
+HorizDrag:          0.70
+VertDrag:           0.80
+ParasDrag:          0.01
+SpeedEps:           0.0001
+
+# Trajectory sampling
+SamplingDT:         0.03333   # 30 Hz (1/30 s)
