@@ -121,4 +121,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN ln -sf /usr/lib/x86_64-linux-gnu/libffi.so.7.1.0 /opt/conda/envs/yopo/lib/libffi.so.7
 
+# Ensure ROS Python runtime deps are available in the active conda env.
+RUN pip install --no-cache-dir rospkg catkin_pkg
+
 CMD ["/bin/bash"]
