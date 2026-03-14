@@ -1,0 +1,22 @@
+dataset_root: dataset/gcopter_trajs
+scene_id: 0
+traj_id: 0
+
+frame_id: world
+topic_map: /collect/map
+topic_path: /collect/path
+topic_marker: /collect/drone_marker
+
+rate: 30.0
+check_collision: true
+collision_radius: 0.5
+
+# Set output path(s) when you want export.
+video_out: "dataset/replay/depth.mp4"
+rgb_video_out: "dataset/replay/rgb.mp4"
+video_only: false
+loop: false
+
+# Unified output resolution for exported videos.
+img_width: 160
+img_height: 96

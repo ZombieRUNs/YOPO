@@ -6,8 +6,8 @@ For each scene:
   2. Load PLY into GCOPTER VoxelMap.
   3. Sample random start/goal pairs (collision-free via Flightmare reset).
   4. Plan MINCO trajectory with GCOPTER (C++ via Pybind11).
-  5. Walk the trajectory at 30 Hz, set drone state, collect depth images.
-  6. Save coeffs, durations, waypoints, depths, and meta info.
+  5. Walk the trajectory at 30 Hz, set drone state, collect depth and RGB images.
+  6. Save coeffs, durations, waypoints, depths.npy, rgb.mp4, and meta info.
 
 Output layout:
   dataset/gcopter_trajs/
@@ -19,7 +19,8 @@ Output layout:
         coeffs.npy       [N*3, 6]  float64 (descending: col0=t^5, col5=const)
         durations.npy    [N]       float64
         waypoints.npy    [M, 13]   float32  [t,px,py,pz,vx,vy,vz,ax,ay,az,jx,jy,jz]
-        depths.npy       [M,96,160] float16  (0..1 normalised, 20m clip)
+        depths.npy       [M,H,W]     float16 (0..1 normalised, 20m clip)
+        rgb.mp4          RGB video aligned with waypoint order (CFR)
         start_pva.npy    [3, 3]
         goal_pva.npy     [3, 3]
       traj_0001/
@@ -31,7 +32,9 @@ import json
 import math
 import os
 import shutil
+import sys
 
+import cv2
 import numpy as np
 from ruamel.yaml import YAML, RoundTripDumper, dump
 
@@ -44,6 +47,9 @@ MIN_DIST = 5.0       # metres
 MAX_DIST = 20.0      # metres
 DT = 1.0 / 30.0      # 30 Hz
 SAVE_ROOT = "dataset/gcopter_trajs"
+DEFAULT_IMG_WIDTH = 160
+DEFAULT_IMG_HEIGHT = 96
+DEFAULT_RGB_FPS = 30.0
 
 MAP_BOUND = [-25.0, 25.0, -25.0, 25.0, 0.0, 5.0]  # [xmin,xmax,ymin,ymax,zmin,zmax]
 VOXEL_WIDTH = 0.25   # metres
@@ -55,6 +61,7 @@ FLIGHTMARE_PATH = os.environ.get("FLIGHTMARE_PATH",
                                   os.path.dirname(_SCRIPT_DIR))
 PLY_DIR = os.path.join(FLIGHTMARE_PATH, "run", "yopo_sim")
 CFG_PATH = os.path.join(FLIGHTMARE_PATH, "flightlib", "configs")
+DEFAULT_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "configs", "collect_gcopter_trajs.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -98,9 +105,27 @@ def sample_pair(env, planner, min_d, max_d, max_tries=300):
     return None
 
 
-def collect_depths(env, flatmap, waypoints):
+def save_rgb_video(rgbs: np.ndarray, out_path: str, fps: float) -> None:
+    """Save RGB frames [M,H,W,3] uint8 as mp4."""
+    if rgbs.ndim != 4 or rgbs.shape[-1] != 3:
+        raise ValueError(f"rgbs must be [M,H,W,3], got {rgbs.shape}")
+    m, h, w, _ = rgbs.shape
+    if m == 0:
+        raise ValueError("Cannot save empty RGB sequence.")
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer: {out_path}")
+    for i in range(m):
+        frame_rgb = rgbs[i]
+        if frame_rgb.dtype != np.uint8:
+            frame_rgb = np.clip(frame_rgb, 0, 255).astype(np.uint8)
+        writer.write(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+    writer.release()
+
+
+def collect_images(env, flatmap, waypoints, img_width, img_height):
     """
-    Walk the trajectory and collect depth images at each waypoint.
+    Walk the trajectory and collect depth/RGB images at each waypoint.
 
     Args:
         env:        Flightmare FlightEnvVec
@@ -108,11 +133,13 @@ def collect_depths(env, flatmap, waypoints):
         waypoints:  ndarray [M, 13]
 
     Returns:
-        depths: ndarray [M, 96, 160] float16, normalised to [0, 1]
+        depths: ndarray [M, H, W] float16, normalised to [0, 1]
                 (normalisation is done by vec_env_wrapper.getDepthImage)
+        rgbs:   ndarray [M, H, W, 3] uint8
     """
     M = len(waypoints)
-    depths = np.zeros((M, 96, 160), dtype=np.float16)
+    depths = np.zeros((M, img_height, img_width), dtype=np.float16)
+    rgbs = np.zeros((M, img_height, img_width, 3), dtype=np.uint8)
 
     for k in range(M):
         t, px, py, pz, vx, vy, vz, ax, ay, az, jx, jy, jz = waypoints[k]
@@ -134,10 +161,21 @@ def collect_depths(env, flatmap, waypoints):
         env.render()
 
         # getDepthImage() returns [num_envs, 1, net_h, net_w], already normalised [0,1]
-        depth = env.getDepthImage()[0][0]   # → [96, 160]
-        depths[k] = depth.astype(np.float16)
+        depth = env.getDepthImage()[0][0]
+        # getRGBImage(rgb=True) returns [num_envs, H*W*3], uint8.
+        rgb_flat = env.getRGBImage(rgb=True)[0]
+        rgb = np.reshape(rgb_flat, (env.img_height, env.img_width, 3))
 
-    return depths
+        # Keep depth/rgb at a unified, configurable output resolution.
+        if depth.shape != (img_height, img_width):
+            depth = cv2.resize(depth.astype(np.float32), (img_width, img_height), interpolation=cv2.INTER_LINEAR)
+        if rgb.shape[:2] != (img_height, img_width):
+            rgb = cv2.resize(rgb, (img_width, img_height), interpolation=cv2.INTER_LINEAR)
+
+        depths[k] = depth.astype(np.float16)
+        rgbs[k] = rgb.astype(np.uint8)
+
+    return depths, rgbs
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +186,13 @@ def main(args):
     import gcopter_planner
     from flightgym import QuadrotorEnv_v1
     from flightpolicy.envs import vec_env_wrapper as wrapper
+
+    if args.img_width <= 0 or args.img_height <= 0:
+        raise ValueError("--img_width and --img_height must be positive integers.")
+    if args.min_dist <= 0 or args.max_dist <= args.min_dist:
+        raise ValueError("Require 0 < min_dist < max_dist.")
+    if args.rgb_fps <= 0:
+        raise ValueError("--rgb_fps must be positive.")
 
     # Flightmare environment — QuadrotorEnv_v1 expects ruamel.yaml-dumped string
     vec_cfg_path = os.path.join(CFG_PATH, "vec_env.yaml")
@@ -186,7 +231,10 @@ def main(args):
         "total_scenes": args.num_scenes,
         "total_trajectories": 0,
         "dt": DT,
-        "img_shape": [96, 160],
+        "img_shape": [args.img_height, args.img_width],
+        "rgb_shape": [args.img_height, args.img_width, 3],
+        "rgb_storage": "rgb.mp4",
+        "rgb_fps": args.rgb_fps,
         "img_range": "0-1 normalised, 20m clip",
         "scenes": [],
     }
@@ -216,7 +264,7 @@ def main(args):
         while traj_count < args.trajs_per_scene and attempts < max_attempts:
             attempts += 1
 
-            pair = sample_pair(env, planner, MIN_DIST, MAX_DIST)
+            pair = sample_pair(env, planner, args.min_dist, args.max_dist)
             if pair is None:
                 continue
 
@@ -231,9 +279,11 @@ def main(args):
             if not result["success"]:
                 continue
 
-            # Collect depth images along the trajectory
+            # Collect depth/RGB images along the trajectory
             waypoints = result["waypoints"].astype(np.float32)
-            depths = collect_depths(env, flatmap, waypoints)
+            depths, rgbs = collect_images(
+                env, flatmap, waypoints, img_width=args.img_width, img_height=args.img_height
+            )
 
             # Save
             tdir = os.path.join(scene_dir, f"traj_{traj_count:04d}")
@@ -243,6 +293,7 @@ def main(args):
             np.save(os.path.join(tdir, "durations.npy"), result["durations"])
             np.save(os.path.join(tdir, "waypoints.npy"), waypoints)
             np.save(os.path.join(tdir, "depths.npy"),    depths)
+            save_rgb_video(rgbs, os.path.join(tdir, "rgb.mp4"), args.rgb_fps)
             np.save(os.path.join(tdir, "start_pva.npy"), np.stack([sp, sv, sa]))
             np.save(os.path.join(tdir, "goal_pva.npy"),  np.stack([gp, gv, ga]))
 
@@ -254,6 +305,10 @@ def main(args):
                         "total_duration": result["total_duration"],
                         "num_pieces": result["num_pieces"],
                         "dt": DT,
+                        "img_width": args.img_width,
+                        "img_height": args.img_height,
+                        "rgb_fps": args.rgb_fps,
+                        "rgb_file": "rgb.mp4",
                     },
                     f,
                 )
@@ -273,9 +328,44 @@ def main(args):
     print(f"\nDone. {index['total_trajectories']} trajectories saved to {save_root}/")
 
 
-if __name__ == "__main__":
+def load_yaml_config(config_path: str) -> dict:
+    if not config_path:
+        return {}
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    cfg = YAML(typ="safe").load(open(config_path, "r"))
+    if cfg is None:
+        return {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config root must be a dict: {config_path}")
+    return cfg
+
+
+def parse_args():
+    argv = [a for a in sys.argv[1:] if not a.startswith("__")]
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=DEFAULT_CONFIG_PATH)
+    pre_args, _ = pre.parse_known_args(argv)
+    cfg = load_yaml_config(pre_args.config)
+
     parser = argparse.ArgumentParser(description="Collect GCOPTER trajectory dataset")
+    parser.add_argument("--config",          type=str, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--num_scenes",      type=int, default=NUM_SCENES)
     parser.add_argument("--trajs_per_scene", type=int, default=TRAJS_PER_SCENE)
     parser.add_argument("--save_root",       type=str, default=SAVE_ROOT)
-    main(parser.parse_args())
+    parser.add_argument("--img_width",       type=int, default=DEFAULT_IMG_WIDTH)
+    parser.add_argument("--img_height",      type=int, default=DEFAULT_IMG_HEIGHT)
+    parser.add_argument("--min_dist",        type=float, default=MIN_DIST)
+    parser.add_argument("--max_dist",        type=float, default=MAX_DIST)
+    parser.add_argument("--rgb_fps",         type=float, default=DEFAULT_RGB_FPS)
+
+    valid_keys = {a.dest for a in parser._actions}
+    unknown = sorted([k for k in cfg.keys() if k not in valid_keys])
+    if unknown:
+        raise ValueError(f"Unknown keys in config {pre_args.config}: {unknown}")
+    parser.set_defaults(**cfg)
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    main(parse_args())

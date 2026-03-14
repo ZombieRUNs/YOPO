@@ -1,0 +1,14 @@
+num_scenes: 50
+trajs_per_scene: 30
+save_root: dataset/gcopter_trajs
+
+# Unified output resolution for both depths.npy and rgb.mp4
+img_width: 160
+img_height: 96
+
+# Start/goal sampling distance constraints (meters)
+min_dist: 5.0
+max_dist: 20.0
+
+# RGB video fps when saving traj_xxxx/rgb.mp4
+rgb_fps: 30.0
