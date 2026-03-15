@@ -7,8 +7,8 @@ img_width: 160
 img_height: 96
 
 # Start/goal sampling distance constraints (meters)
-min_dist: 5.0
-max_dist: 20.0
+min_dist: 10.0
+max_dist: 30.0
 
 # RGB video fps when saving traj_xxxx/rgb.mp4
 rgb_fps: 30.0
