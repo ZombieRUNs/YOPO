@@ -218,6 +218,7 @@ def main(args):
     # GCOPTER planner
     planner_cfg = os.path.join(CFG_PATH, "gcopter_config.yaml")
     planner = gcopter_planner.GcopterPlanner(planner_cfg)
+    v_max = float(YAML(typ="safe").load(open(planner_cfg, "r")).get("MaxVelMag", 4.0))
 
     # FlatnessMap (same physical params as planner config)
     cfg = planner.getConfig()
@@ -296,6 +297,7 @@ def main(args):
             save_rgb_video(rgbs, os.path.join(tdir, "rgb.mp4"), args.rgb_fps)
             np.save(os.path.join(tdir, "start_pva.npy"), np.stack([sp, sv, sa]))
             np.save(os.path.join(tdir, "goal_pva.npy"),  np.stack([gp, gv, ga]))
+            np.save(os.path.join(tdir, "v_max.npy"),     np.float32(v_max))
 
             with open(os.path.join(tdir, "meta.json"), "w") as f:
                 json.dump(
