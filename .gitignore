@@ -41,5 +41,11 @@ flightlib/build/
 # claude.md
 CLAUDE.md
 
+# agent.md
+AGENTS.md
+
 # dataset
 run/dataset/
+
+# test trajectories
+run/flowpilot_env_loop/*
