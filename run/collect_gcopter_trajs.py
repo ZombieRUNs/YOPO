@@ -33,6 +33,7 @@ import math
 import os
 import shutil
 import sys
+import tempfile
 
 import cv2
 import numpy as np
@@ -50,6 +51,9 @@ SAVE_ROOT = "dataset/gcopter_trajs"
 DEFAULT_IMG_WIDTH = 160
 DEFAULT_IMG_HEIGHT = 96
 DEFAULT_RGB_FPS = 30.0
+DEFAULT_VMAX_MIN = 7.0
+DEFAULT_VMAX_MAX = 7.0
+DEFAULT_CAMERA_PITCH_DEG = 0.0
 
 MAP_BOUND = [-25.0, 25.0, -25.0, 25.0, 0.0, 5.0]  # [xmin,xmax,ymin,ymax,zmin,zmax]
 VOXEL_WIDTH = 0.25   # metres
@@ -76,6 +80,18 @@ def quat_to_rot(q):
         [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
         [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
     ])
+
+
+def quat_mul(q1, q2):
+    """Quaternion multiply (wxyz): q = q1 * q2."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dtype=np.float64)
 
 
 def obs_to_world_pva(obs):
@@ -123,7 +139,7 @@ def save_rgb_video(rgbs: np.ndarray, out_path: str, fps: float) -> None:
     writer.release()
 
 
-def collect_images(env, flatmap, waypoints, img_width, img_height):
+def collect_images(env, flatmap, waypoints, img_width, img_height, camera_pitch_deg=0.0):
     """
     Walk the trajectory and collect depth/RGB images at each waypoint.
 
@@ -141,6 +157,9 @@ def collect_images(env, flatmap, waypoints, img_width, img_height):
     depths = np.zeros((M, img_height, img_width), dtype=np.float16)
     rgbs = np.zeros((M, img_height, img_width, 3), dtype=np.uint8)
 
+    pitch_rad = float(camera_pitch_deg) * math.pi / 180.0
+    q_pitch = np.array([math.cos(0.5 * pitch_rad), 0.0, math.sin(0.5 * pitch_rad), 0.0], dtype=np.float64)
+
     for k in range(M):
         t, px, py, pz, vx, vy, vz, ax, ay, az, jx, jy, jz = waypoints[k]
         vel = np.array([vx, vy, vz])
@@ -155,6 +174,12 @@ def collect_images(env, flatmap, waypoints, img_width, img_height):
             psi = math.atan2(vy, vx)
             _thr, quat, _omg = flatmap.forward(vel, acc, jer, psi, 0.0)
             quat = np.array(quat)
+
+        if abs(pitch_rad) > 1e-12:
+            quat = quat_mul(quat.astype(np.float64), q_pitch)
+            n = np.linalg.norm(quat)
+            if n > 1e-12:
+                quat = quat / n
 
         # setState sets C++ state; render() syncs with Unity and fills image buffer
         env.setState(np.array([px, py, pz]), vel, acc, quat)
@@ -178,6 +203,26 @@ def collect_images(env, flatmap, waypoints, img_width, img_height):
     return depths, rgbs
 
 
+def make_planner_with_vmax(gcopter_planner_mod, planner_cfg_path: str, v_max: float):
+    """Create a fresh GcopterPlanner with overridden MaxVelMag."""
+    cfg_obj = YAML(typ="safe").load(open(planner_cfg_path, "r"))
+    if not isinstance(cfg_obj, dict):
+        raise ValueError(f"Invalid planner config: {planner_cfg_path}")
+    cfg_obj["MaxVelMag"] = float(v_max)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tf:
+        tmp_cfg_path = tf.name
+        YAML().dump(cfg_obj, tf)
+    try:
+        planner = gcopter_planner_mod.GcopterPlanner(tmp_cfg_path)
+    finally:
+        try:
+            os.remove(tmp_cfg_path)
+        except OSError:
+            pass
+    return planner
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -193,6 +238,10 @@ def main(args):
         raise ValueError("Require 0 < min_dist < max_dist.")
     if args.rgb_fps <= 0:
         raise ValueError("--rgb_fps must be positive.")
+    if args.v_max_min <= 0 or args.v_max_max < args.v_max_min:
+        raise ValueError("Require 0 < v_max_min <= v_max_max.")
+    if not np.isfinite(args.camera_pitch_deg):
+        raise ValueError("--camera_pitch_deg must be finite.")
 
     # Flightmare environment — QuadrotorEnv_v1 expects ruamel.yaml-dumped string
     vec_cfg_path = os.path.join(CFG_PATH, "vec_env.yaml")
@@ -218,7 +267,6 @@ def main(args):
     # GCOPTER planner
     planner_cfg = os.path.join(CFG_PATH, "gcopter_config.yaml")
     planner = gcopter_planner.GcopterPlanner(planner_cfg)
-    v_max = float(YAML(typ="safe").load(open(planner_cfg, "r")).get("MaxVelMag", 4.0))
 
     # FlatnessMap (same physical params as planner config)
     cfg = planner.getConfig()
@@ -244,7 +292,7 @@ def main(args):
         # Generate scene + export PLY
         print(f"[scene {scene_id}] spawnTrees", flush=True)
         env.setMapID(np.array([scene_id]))
-        env.spawnTreesAndSavePointcloud(scene_id, spacing=4.0)
+        env.spawnTreesAndSavePointcloud(scene_id, spacing=3.16)
         ply_src = os.path.join(PLY_DIR, f"pointcloud-{scene_id}.ply")
 
         # Load into GCOPTER VoxelMap
@@ -270,8 +318,15 @@ def main(args):
                 continue
 
             sp, sv, sa, gp, gv, ga = pair
-            print(f"[scene {scene_id}] plan attempt {attempts}: {sp} -> {gp}", flush=True)
-            result = planner.plan(
+            v_max = float(np.random.uniform(args.v_max_min, args.v_max_max))
+            planner_run = make_planner_with_vmax(gcopter_planner, planner_cfg, v_max)
+            planner_run.loadScene(ply_src, map_bound, VOXEL_WIDTH, DILATE_R)
+            print(
+                f"[scene {scene_id}] plan attempt {attempts}: {sp} -> {gp} "
+                f"(v_max={v_max:.3f})",
+                flush=True,
+            )
+            result = planner_run.plan(
                 sp, sv, sa,
                 gp, gv, ga,
             )
@@ -283,7 +338,10 @@ def main(args):
             # Collect depth/RGB images along the trajectory
             waypoints = result["waypoints"].astype(np.float32)
             depths, rgbs = collect_images(
-                env, flatmap, waypoints, img_width=args.img_width, img_height=args.img_height
+                env, flatmap, waypoints,
+                img_width=args.img_width,
+                img_height=args.img_height,
+                camera_pitch_deg=args.camera_pitch_deg,
             )
 
             # Save
@@ -311,6 +369,8 @@ def main(args):
                         "img_height": args.img_height,
                         "rgb_fps": args.rgb_fps,
                         "rgb_file": "rgb.mp4",
+                        "v_max": v_max,
+                        "camera_pitch_deg": args.camera_pitch_deg,
                     },
                     f,
                 )
@@ -360,6 +420,9 @@ def parse_args():
     parser.add_argument("--min_dist",        type=float, default=MIN_DIST)
     parser.add_argument("--max_dist",        type=float, default=MAX_DIST)
     parser.add_argument("--rgb_fps",         type=float, default=DEFAULT_RGB_FPS)
+    parser.add_argument("--v_max_min",       type=float, default=DEFAULT_VMAX_MIN)
+    parser.add_argument("--v_max_max",       type=float, default=DEFAULT_VMAX_MAX)
+    parser.add_argument("--camera_pitch_deg", type=float, default=DEFAULT_CAMERA_PITCH_DEG)
 
     valid_keys = {a.dest for a in parser._actions}
     unknown = sorted([k for k in cfg.keys() if k not in valid_keys])

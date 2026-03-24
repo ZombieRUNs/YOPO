@@ -57,6 +57,21 @@ def quat_to_rot(q: np.ndarray) -> np.ndarray:
     )
 
 
+def quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Quaternion multiply in wxyz convention: q = q1 * q2."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dtype=np.float64,
+    )
+
+
 def obs_to_world_pva(obs: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Convert Flightmare obs [1,13] into world-frame p/v/a."""
     pos = obs[0, 0:3].astype(np.float64).copy()
@@ -128,9 +143,15 @@ def build_state_goal(
     cur: WorldState,
     goal_pos_world: np.ndarray,
     get_body_frame_fn,
+    quat_wb_override: np.ndarray = None,
+    r_wb_override: np.ndarray = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build FlowPilot state_goal[25] from current world state and fixed goal."""
-    quat_wb, r_wb = get_body_frame_fn(cur.vel, cur.acc, cur.jerk)  # world <- body
+    if quat_wb_override is not None and r_wb_override is not None:
+        quat_wb = quat_wb_override.astype(np.float64)
+        r_wb = r_wb_override.astype(np.float64)
+    else:
+        quat_wb, r_wb = get_body_frame_fn(cur.vel, cur.acc, cur.jerk)  # world <- body
     r_bw = r_wb.T
 
     state_pos = np.zeros(3, dtype=np.float32)
@@ -146,6 +167,24 @@ def build_state_goal(
 
     state_goal = np.concatenate([state_12d, quat_wb.astype(np.float32), goal_9d], axis=0)
     return state_goal, quat_wb, r_wb
+
+
+def yaw_frame_from_start_to_goal(
+    start_pos_world: np.ndarray,
+    goal_pos_world: np.ndarray,
+    eps: float = 1e-6,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return yaw-only body frame (quat, R) whose x-axis points from start to goal on XY plane."""
+    dx = float(goal_pos_world[0] - start_pos_world[0])
+    dy = float(goal_pos_world[1] - start_pos_world[1])
+    if (dx * dx + dy * dy) < eps * eps:
+        return None, None
+    yaw = float(np.arctan2(dy, dx))
+    cy = float(np.cos(0.5 * yaw))
+    sy = float(np.sin(0.5 * yaw))
+    quat_wb = np.array([cy, 0.0, 0.0, sy], dtype=np.float64)  # yaw around +Z
+    r_wb = quat_to_rot(quat_wb)
+    return quat_wb, r_wb
 
 
 def sample_start_goal_world(
@@ -218,6 +257,7 @@ def main():
     parser.add_argument("--show_depth", action="store_true")
     parser.add_argument("--depth_window_w", type=int, default=480, help="cv2 depth window width when --show_depth is enabled.")
     parser.add_argument("--depth_window_h", type=int, default=300, help="cv2 depth window height when --show_depth is enabled.")
+    parser.add_argument("--camera_pitch_deg", type=float, default=0.0, help="Render-only camera pitch offset (deg). Applied in env.setState only.")
     parser.add_argument("--compile_model", action="store_true", help="Enable torch.compile for FlowPilotPhase2 inference.")
     parser.add_argument(
         "--debug_stop_after",
@@ -237,6 +277,8 @@ def main():
         raise ValueError("--num_trajs must be >= 1.")
     if args.depth_video_fps <= 0:
         raise ValueError("--depth_video_fps must be positive.")
+    if not np.isfinite(args.camera_pitch_deg):
+        raise ValueError("--camera_pitch_deg must be finite.")
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -244,6 +286,8 @@ def main():
     if args.show_depth:
         cv2.namedWindow("depth", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("depth", args.depth_window_w, args.depth_window_h)
+    pitch_rad = float(args.camera_pitch_deg) * np.pi / 180.0
+    q_pitch = np.array([np.cos(0.5 * pitch_rad), 0.0, np.sin(0.5 * pitch_rad), 0.0], dtype=np.float64)
 
     flightmare_path = os.environ.get("FLIGHTMARE_PATH", str(Path(__file__).resolve().parents[1]))
     os.environ.setdefault("FLIGHTMARE_PATH", flightmare_path)
@@ -356,9 +400,22 @@ def main():
             print(f"[traj {traj_idx:03d}] failed to sample collision-free start/goal, skip.", flush=True)
             continue
 
-        # Render initial condition frame.
-        state_goal, quat_wb, r_wb = build_state_goal(cur, goal_pos_world, get_body_frame_fn)
-        env.setState(cur.pos, cur.vel, cur.acc, quat_wb)
+        # Render initial condition frame. Force initial yaw to point from start to goal.
+        init_quat_wb, init_r_wb = yaw_frame_from_start_to_goal(cur.pos, goal_pos_world)
+        if init_quat_wb is not None and init_r_wb is not None:
+            state_goal, quat_wb, r_wb = build_state_goal(
+                cur,
+                goal_pos_world,
+                get_body_frame_fn,
+                quat_wb_override=init_quat_wb,
+                r_wb_override=init_r_wb,
+            )
+        else:
+            state_goal, quat_wb, r_wb = build_state_goal(cur, goal_pos_world, get_body_frame_fn)
+        quat_render = _safe_quat(np.asarray(quat_wb, dtype=np.float64))
+        if abs(pitch_rad) > 1e-12:
+            quat_render = _safe_quat(quat_mul(quat_render, q_pitch))
+        env.setState(cur.pos, cur.vel, cur.acc, quat_render)
         env.render()
         cond_depth = env.getDepthImage()[0][0].astype(np.float32)  # [96,160]
         depth_frames_u8: List[np.ndarray] = [np.clip(cond_depth * 255.0, 0, 255).astype(np.uint8)]
@@ -428,6 +485,8 @@ def main():
                 jk = wp_world[k, 9:12]
                 quat_k, _ = get_body_frame_fn(vk, ak, jk)
                 quat_k = _safe_quat(np.asarray(quat_k, dtype=np.float64))
+                if abs(pitch_rad) > 1e-12:
+                    quat_k = _safe_quat(quat_mul(quat_k, q_pitch))
                 if not (np.all(np.isfinite(pk)) and np.all(np.isfinite(vk)) and np.all(np.isfinite(ak))):
                     print(f"[traj {traj_idx:03d} loop {loop_idx:03d}] invalid state at k={k}, stop.", flush=True)
                     break
