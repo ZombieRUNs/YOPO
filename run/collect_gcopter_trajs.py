@@ -32,6 +32,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -51,9 +52,9 @@ SAVE_ROOT = "dataset/gcopter_trajs"
 DEFAULT_IMG_WIDTH = 160
 DEFAULT_IMG_HEIGHT = 96
 DEFAULT_RGB_FPS = 30.0
-DEFAULT_VMAX_MIN = 7.0
+DEFAULT_VMAX_MIN = 5.0
 DEFAULT_VMAX_MAX = 7.0
-DEFAULT_CAMERA_PITCH_DEG = 0.0
+DEFAULT_CAMERA_PITCH_DEG = -10.0
 
 MAP_BOUND = [-25.0, 25.0, -25.0, 25.0, 0.0, 5.0]  # [xmin,xmax,ymin,ymax,zmin,zmax]
 VOXEL_WIDTH = 0.25   # metres
@@ -223,6 +224,34 @@ def make_planner_with_vmax(gcopter_planner_mod, planner_cfg_path: str, v_max: fl
     return planner
 
 
+def build_flightmare_env():
+    """Prefer NVIDIA PRIME offload on hybrid-graphics Linux setups."""
+    env = os.environ.copy()
+    if env.get("DISPLAY"):
+        env.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
+        env.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+        env.setdefault("__VK_LAYER_NV_optimus", "NVIDIA_only")
+    return env
+
+
+def launch_flightmare(binary_path: str):
+    """Launch Flightmare in the background with NVIDIA offload hints when available."""
+    env = build_flightmare_env()
+    launch_env = {
+        "DISPLAY": env.get("DISPLAY", ""),
+        "__NV_PRIME_RENDER_OFFLOAD": env.get("__NV_PRIME_RENDER_OFFLOAD", ""),
+        "__GLX_VENDOR_LIBRARY_NAME": env.get("__GLX_VENDOR_LIBRARY_NAME", ""),
+        "__VK_LAYER_NV_optimus": env.get("__VK_LAYER_NV_optimus", ""),
+    }
+    print(f"[INFO] launching Flightmare with env={launch_env}", flush=True)
+    return subprocess.Popen(
+        [binary_path],
+        cwd=os.path.dirname(binary_path),
+        env=env,
+        start_new_session=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -251,7 +280,7 @@ def main(args):
     cfg["env"]["render"] = True
     cfg["env"]["supervised"] = False
     cfg["env"]["imitation"] = False
-    os.system(FLIGHTMARE_PATH + "/flightrender/RPG_Flightmare/flightmare.x86_64 &")
+    launch_flightmare(os.path.join(FLIGHTMARE_PATH, "flightrender", "RPG_Flightmare", "flightmare.x86_64"))
     env = wrapper.FlightEnvVec(QuadrotorEnv_v1(dump(cfg, Dumper=RoundTripDumper), False))
     env.connectUnity()
 
