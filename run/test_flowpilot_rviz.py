@@ -256,6 +256,64 @@ def infer_one_step(model, vae_encoder, basis, scheduler,
 
 
 # ---------------------------------------------------------------------------
+# PLY loader (numpy only, no open3d dependency)
+# ---------------------------------------------------------------------------
+
+def _load_ply_xyz(path: str) -> np.ndarray:
+    """Read xyz points from a binary or ASCII PLY file. Returns [N,3] float32."""
+    with open(path, 'rb') as f:
+        # Parse header
+        header_lines = []
+        while True:
+            line = f.readline().decode('ascii', errors='ignore').strip()
+            header_lines.append(line)
+            if line == 'end_header':
+                break
+        header = '\n'.join(header_lines)
+
+        # Count vertices
+        n_verts = 0
+        for line in header_lines:
+            if line.startswith('element vertex'):
+                n_verts = int(line.split()[-1])
+                break
+
+        # Detect binary vs ASCII and property order
+        is_binary_le = 'format binary_little_endian' in header
+        is_binary_be = 'format binary_big_endian' in header
+
+        props = []
+        in_vertex = False
+        for line in header_lines:
+            if line.startswith('element vertex'):
+                in_vertex = True
+            elif line.startswith('element') and in_vertex:
+                break
+            elif in_vertex and line.startswith('property'):
+                parts = line.split()
+                props.append((parts[1], parts[2]))  # (type, name)
+
+        prop_names = [p[1] for p in props]
+        prop_types = [p[0] for p in props]
+        type_map   = {'float': 'f4', 'float32': 'f4', 'double': 'f8',
+                      'int': 'i4', 'uint': 'u4', 'uchar': 'u1', 'short': 'i2'}
+        dtype = np.dtype([(name, type_map.get(t, 'f4')) for name, t in zip(prop_names, prop_types)])
+
+        if is_binary_le or is_binary_be:
+            raw  = np.frombuffer(f.read(n_verts * dtype.itemsize), dtype=dtype)
+            if is_binary_be:
+                raw = raw.byteswap().newbyteorder()
+        else:
+            rows = [f.readline().decode().split() for _ in range(n_verts)]
+            raw  = np.array([tuple(r) for r in rows], dtype=dtype)
+
+    x = raw['x'].astype(np.float32)
+    y = raw['y'].astype(np.float32)
+    z = raw['z'].astype(np.float32)
+    return np.stack([x, y, z], axis=1)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -338,9 +396,7 @@ def main():
     ply_path = os.path.join(flightmare_path, 'run', 'yopo_sim', f'pointcloud-{args.scene_id}.ply')
     if os.path.exists(ply_path):
         try:
-            import open3d as o3d
-            pcd = o3d.io.read_point_cloud(ply_path)
-            pts = np.asarray(pcd.points, dtype=np.float32)
+            pts = _load_ply_xyz(ply_path)
             map_header = Header()
             map_header.stamp = rospy.Time.now()
             map_header.frame_id = 'world'
