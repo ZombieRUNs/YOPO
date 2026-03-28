@@ -290,6 +290,7 @@ def main():
     # --- ROS init ---
     rospy.init_node('flowpilot_rviz', anonymous=False)
     traj_pub   = rospy.Publisher('/flowpilot/best_traj_visual', PointCloud2, queue_size=1)
+    map_pub    = rospy.Publisher('/local_map',                  PointCloud2, queue_size=1, latch=True)
     depth_pub  = rospy.Publisher('/depth_image',                Image,       queue_size=1)
     marker_pub = rospy.Publisher('/uav_mesh',                   Marker,      queue_size=1)
     goal_pub   = rospy.Publisher('/flowpilot/goal_marker',      Marker,      queue_size=1)
@@ -332,6 +333,23 @@ def main():
 
     env.spawnTreesAndSavePointcloud(args.scene_id, spacing=3.5)
     env.render()
+
+    # --- Publish scene point cloud (latched, published once) ---
+    ply_path = os.path.join(flightmare_path, 'run', 'yopo_sim', f'pointcloud-{args.scene_id}.ply')
+    if os.path.exists(ply_path):
+        try:
+            import open3d as o3d
+            pcd = o3d.io.read_point_cloud(ply_path)
+            pts = np.asarray(pcd.points, dtype=np.float32)
+            map_header = Header()
+            map_header.stamp = rospy.Time.now()
+            map_header.frame_id = 'world'
+            map_pub.publish(point_cloud2.create_cloud_xyz32(map_header, pts))
+            print(f'[map] published {len(pts)} points from {ply_path}')
+        except Exception as e:
+            print(f'[map] failed to load/publish pointcloud: {e}')
+    else:
+        print(f'[map] PLY not found: {ply_path} (skip)')
 
     # --- Model ---
     model = FlowPilotPhase2(
