@@ -332,6 +332,8 @@ def parse_args():
     p.add_argument('--goal_reach_dist',   type=float, default=4.0)
     p.add_argument('--camera_pitch_deg',  type=float, default=0.0)
     p.add_argument('--compile_model',     action='store_true')
+    p.add_argument('--launch_unity',      action='store_true',
+                   help='Auto-launch flightmare.x86_64 before connecting')
     return p.parse_args()
 
 
@@ -375,6 +377,9 @@ def main():
 
     from flightgym import QuadrotorEnv_v1
     from flightpolicy.envs import vec_env_wrapper as wrapper
+
+    if args.launch_unity:
+        os.system(os.path.join(flightmare_path, 'flightrender/RPG_Flightmare/flightmare.x86_64 &'))
 
     cfg_path = os.path.join(flightmare_path, 'flightlib', 'configs', 'vec_env.yaml')
     cfg = YAML().load(open(cfg_path))
@@ -448,6 +453,8 @@ def main():
     q_pitch   = np.array([math.cos(0.5*pitch_rad), 0.0, math.sin(0.5*pitch_rad), 0.0], dtype=np.float64)
 
     # --- Main loop ---
+    cur = None  # persists across trajectories; None only on first run
+
     while not rospy.is_shutdown():
         # Wait for goal
         with _goal_lock:
@@ -457,10 +464,11 @@ def main():
             time.sleep(0.1)
             continue
 
-        # Reset env, sample start from env.reset()
-        obs  = env.reset()
-        pos0, vel0, acc0 = obs_to_world_pva(obs)
-        cur  = WorldState(pos=pos0, vel=np.zeros(3), acc=np.zeros(3), jerk=np.zeros(3))
+        # First run: initialize from env.reset(); subsequent runs: reuse last position
+        if cur is None:
+            obs = env.reset()
+            pos0, _, _ = obs_to_world_pva(obs)
+            cur = WorldState(pos=pos0, vel=np.zeros(3), acc=np.zeros(3), jerk=np.zeros(3))
 
         # Initial yaw pointing toward goal
         init_q, init_r = yaw_frame_from_start_to_goal(cur.pos, goal_pos)
@@ -549,7 +557,7 @@ def main():
                 with _goal_lock:
                     _goal_received = False
                     _goal_pos_world = None
-                break
+                break  # cur keeps last position; next goal starts from here
 
             loop_idx += 1
 
