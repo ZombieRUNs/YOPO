@@ -66,12 +66,9 @@ YOPO_SIM_DIR       = os.path.join(_SCRIPT_DIR, "yopo_sim")
 GCOPTER_DATASET_ROOT = "dataset/gcopter_trajs"
 SUPER_DATASET_ROOT   = "dataset/super_trajs"
 
-DT = 1.0 / 30.0
-MAP_BOUND   = [-25.0, 25.0, -25.0, 25.0, 0.0, 5.0]
-VOXEL_WIDTH = 0.25
-DILATE_R    = 0.2   # keep aligned with SUPER robot_r by default
-MIN_DIST    = 30.0
-MAX_DIST    = 40.0
+DT       = 1.0 / 30.0
+MIN_DIST = 30.0
+MAX_DIST = 40.0
 
 DEFAULT_INIT_POS = [-10.0, 20.0, 2.5]   # fallback when env.reset() finds nothing
 
@@ -81,6 +78,20 @@ def clamp_flight_z(pos: np.ndarray, safe_z: float) -> np.ndarray:
     out = np.array(pos, dtype=np.float64).copy()
     out[2] = float(safe_z)
     return out
+
+
+def within_scene_bounds(pos: np.ndarray, center, half, margin: float = 5.0) -> bool:
+    """Return True if pos XY is at least `margin` metres inside the scene bounding box.
+
+    center / half come from quadrotor_env.yaml bounding_box_origin / (0.5 * bounding_box).
+    Only XY is checked; Z is handled separately by clamp_flight_z.
+    """
+    for i in range(2):
+        lo = center[i] - half[i] + margin
+        hi = center[i] + half[i] - margin
+        if not (lo <= pos[i] <= hi):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +116,7 @@ def load_super_runtime_params():
     return {"robot_r": robot_r, "click_height": click_h}
 
 
-def update_super_scene(scene_id: int, init_pos, pcd_dir: str, super_robot_r=None) -> None:
+def update_super_scene(scene_id: int, init_pos, pcd_dir: str, super_robot_r=None, super_max_vel=None) -> None:
     """Update symlink + both YAML configs for a new scene."""
     pcd_src = os.path.join(pcd_dir, f"scene_{scene_id:03d}.pcd")
 
@@ -128,6 +139,8 @@ def update_super_scene(scene_id: int, init_pos, pcd_dir: str, super_robot_r=None
     cfg2["rog_map"]["pcd_name"] = pcd_src
     if super_robot_r is not None:
         cfg2["super_planner"]["robot_r"] = float(super_robot_r)
+    if super_max_vel is not None:
+        cfg2["traj_opt"]["boundary"]["max_vel"] = float(super_max_vel)
     _yaml_dump_rw(cfg2, SUPER_PLANNER_CFG)
 
 
@@ -214,11 +227,12 @@ def cmd_history_to_waypoints(cmd_hist: np.ndarray, dt=DT) -> np.ndarray:
     pos = np.zeros((t_grid.size, 3), dtype=np.float64)
     vel = np.zeros((t_grid.size, 3), dtype=np.float64)
     acc = np.zeros((t_grid.size, 3), dtype=np.float64)
+    jer = np.zeros((t_grid.size, 3), dtype=np.float64)
     for d in range(3):
         pos[:, d] = np.interp(t_grid, t, hist[:, 1 + d])
         vel[:, d] = np.interp(t_grid, t, hist[:, 4 + d])
         acc[:, d] = np.interp(t_grid, t, hist[:, 7 + d])
-    jer = np.gradient(acc, dt, axis=0)
+        jer[:, d] = np.interp(t_grid, t, hist[:, 10 + d])
 
     return np.concatenate(
         [t_grid[:, None], pos, vel, acc, jer], axis=1
@@ -378,6 +392,7 @@ class SuperCollector:
             float(msg.position.x), float(msg.position.y), float(msg.position.z),
             float(msg.velocity.x), float(msg.velocity.y), float(msg.velocity.z),
             float(msg.acceleration.x), float(msg.acceleration.y), float(msg.acceleration.z),
+            float(msg.jerk.x), float(msg.jerk.y), float(msg.jerk.z),
         ], dtype=np.float64)
         with self._lock_cmd:
             self._cmd_history.append(row)
@@ -407,7 +422,7 @@ class SuperCollector:
     def get_cmd_history(self):
         with self._lock_cmd:
             if not self._cmd_history:
-                return np.zeros((0, 10), dtype=np.float64)
+                return np.zeros((0, 13), dtype=np.float64)
             return np.array(self._cmd_history, dtype=np.float64)
 
     # ---- actions ----
@@ -503,6 +518,14 @@ def main(args):
     # ------------------------------------------------------------------ #
     #  Flightmare + GCOPTER (initialised once for the full run)           #
     # ------------------------------------------------------------------ #
+    # Read scene bounding box for boundary-margin filtering of env.reset() samples.
+    quad_env_cfg = YAML().load(open(os.path.join(FLIGHTLIB_CFG, "quadrotor_env.yaml")))
+    _bb      = quad_env_cfg["quadrotor_env"]["bounding_box"]
+    _bb_orig = quad_env_cfg["quadrotor_env"]["bounding_box_origin"]
+    scene_center = np.array([float(_bb_orig[i]) for i in range(2)])
+    scene_half   = np.array([0.5 * float(_bb[i])  for i in range(2)])
+    xy_margin    = 5.0   # metres kept away from scene edge
+
     vec_cfg_path = os.path.join(FLIGHTLIB_CFG, "vec_env.yaml")
     cfg = YAML().load(open(vec_cfg_path))
     cfg["env"]["num_envs"]    = 1
@@ -576,25 +599,19 @@ def main(args):
                 print(f"[SKIP] scene {scene_id}: conversion failed", flush=True)
                 continue
 
-            # ---- Load PLY into GCOPTER for isFree checks ----
-            planner.loadScene(ply_path, MAP_BOUND, VOXEL_WIDTH, args.collision_check_r)
-
-            # ---- Find collision-free init position for SUPER ----
-            init_pos = None
-            for _ in range(300):
+            # ---- Find init position for SUPER via env.reset() ----
+            # env.reset() guarantees collision-free positions (C++ do-while + KdTree).
+            # Additionally filter to keep positions ≥ xy_margin from scene edge.
+            for _ in range(200):
                 obs = env.reset()
-                p_raw = obs[0, 0:3].copy()
-                p = clamp_flight_z(p_raw, args.safe_flight_z)
-                if planner.isFree(p):
-                    init_pos = p
+                _p  = obs[0, 0:3]
+                if within_scene_bounds(_p, scene_center, scene_half, xy_margin):
                     break
-            if init_pos is None:
-                init_pos = clamp_flight_z(np.array(DEFAULT_INIT_POS, dtype=np.float64),
-                                          args.safe_flight_z)
-                print(f"  [WARN] using fallback init_pos {init_pos}", flush=True)
+            init_pos = clamp_flight_z(obs[0, 0:3].copy(), args.safe_flight_z)
 
             # ---- Update SUPER configs ----
-            update_super_scene(scene_id, init_pos, SUPER_FOREST_DIR, super_robot_r=super_robot_r)
+            update_super_scene(scene_id, init_pos, SUPER_FOREST_DIR,
+                               super_robot_r=super_robot_r, super_max_vel=args.super_max_vel)
 
             # ---- Launch SUPER ----
             if ros_proc is not None:
@@ -629,9 +646,10 @@ def main(args):
                 os.symlink(os.path.abspath(ply_path), ply_link)
 
             # ---- Trajectory collection loop ----
-            traj_count = 0
-            attempts   = 0
-            max_att    = args.trajs_per_scene * 5
+            traj_count        = 0
+            attempts          = 0
+            consec_failures   = 0
+            max_att           = args.trajs_per_scene * 5
             current_pos = collector.get_position()
             if current_pos is not None:
                 current_pos = clamp_flight_z(current_pos, args.safe_flight_z)
@@ -639,57 +657,36 @@ def main(args):
             while traj_count < args.trajs_per_scene and attempts < max_att:
                 attempts += 1
 
-                # Teleport to new random start every reset_interval trajectories
-                if traj_count > 0 and traj_count % args.reset_interval == 0:
-                    new_start = None
-                    for _ in range(300):
-                        obs = env.reset()
-                        p = clamp_flight_z(obs[0, 0:3].copy(), args.safe_flight_z)
-                        if planner.isFree(p):
-                            new_start = p
+                # Teleport if too many consecutive failures (drone likely stuck)
+                # or every reset_interval successful trajectories.
+                need_teleport = (consec_failures >= 5) or \
+                                (traj_count > 0 and traj_count % args.reset_interval == 0)
+                if need_teleport:
+                    for _ in range(200):
+                        _ns = env.reset()[0, 0:3]
+                        if within_scene_bounds(_ns, scene_center, scene_half, xy_margin):
                             break
-                    if new_start is not None:
-                        collector.teleport(new_start)
-                        time.sleep(1.0)
-                        current_pos = collector.get_position()
-                        if current_pos is None:
-                            current_pos = new_start.copy()
-                        else:
-                            current_pos = clamp_flight_z(current_pos, args.safe_flight_z)
+                    new_start = clamp_flight_z(_ns, args.safe_flight_z)
+                    collector.teleport(new_start)
+                    time.sleep(1.0)
+                    cp = collector.get_position()
+                    current_pos = clamp_flight_z(cp, args.safe_flight_z) if cp is not None else new_start
+                    consec_failures = 0
 
-                def relocate_to_free_start():
-                    nonlocal current_pos
-                    for _ in range(300):
-                        obs = env.reset()
-                        p = clamp_flight_z(obs[0, 0:3].copy(), args.safe_flight_z)
-                        if planner.isFree(p):
-                            collector.teleport(p)
-                            time.sleep(0.5)
-                            cp = collector.get_position()
-                            current_pos = clamp_flight_z(cp, args.safe_flight_z) if cp is not None else p
-                            return True
-                    return False
-
-                # Sample a collision-free goal within distance range
-                start_pos = (current_pos.copy() if current_pos is not None
-                             else init_pos.copy())
-                start_pos = clamp_flight_z(start_pos, args.safe_flight_z)
-                if not planner.isFree(start_pos):
-                    print(f"  [attempt {attempts}] start not free at {start_pos.round(2)}, resample", flush=True)
-                    if not relocate_to_free_start():
-                        print(f"  [attempt {attempts}] failed to relocate to free start", flush=True)
-                    continue
+                # Sample goal within distance range; env.reset() is already collision-free.
+                # Also require goal to be ≥ xy_margin from scene edge (avoids air-wall hits).
+                start_pos = clamp_flight_z(
+                    current_pos.copy() if current_pos is not None else init_pos.copy(),
+                    args.safe_flight_z)
                 goal_pos = None
                 for _ in range(300):
-                    obs = env.reset()
-                    gp = clamp_flight_z(obs[0, 0:3].copy(), args.safe_flight_z)
-                    if not planner.isFree(gp):
+                    _gp = env.reset()[0, 0:3]
+                    if not within_scene_bounds(_gp, scene_center, scene_half, xy_margin):
                         continue
-                    d = np.linalg.norm(gp - start_pos)
-                    if not (args.min_dist <= d <= args.max_dist):
-                        continue
-                    goal_pos = gp
-                    break
+                    gp = clamp_flight_z(_gp, args.safe_flight_z)
+                    if args.min_dist <= np.linalg.norm(gp - start_pos) <= args.max_dist:
+                        goal_pos = gp
+                        break
 
                 if goal_pos is None:
                     print(f"  [attempt {attempts}] failed to sample valid goal", flush=True)
@@ -720,7 +717,9 @@ def main(args):
                         break
 
                 if not reached_goal:
-                    print(f"  [attempt {attempts}] did not reach goal (remain={dist_to_goal:.2f}m), skip", flush=True)
+                    consec_failures += 1
+                    print(f"  [attempt {attempts}] did not reach goal (remain={dist_to_goal:.2f}m), skip"
+                          f"{' [teleport next]' if consec_failures >= 5 else ''}", flush=True)
                     continue
 
                 cmd_hist = collector.get_cmd_history()
@@ -774,6 +773,7 @@ def main(args):
                     }, f, indent=2)
 
                 traj_count += 1
+                consec_failures = 0
                 print(f"  [traj {traj_count-1:04d}] saved  "
                       f"(exec-trace, {len(durations)} pieces, {total_dur:.1f}s, "
                       f"{len(waypoints)} waypoints)", flush=True)
@@ -858,6 +858,8 @@ def parse_args():
                              "default: SUPER super_planner.robot_r")
     parser.add_argument("--super_robot_r", type=float, default=None,
                         help="Override SUPER super_planner.robot_r before launching each scene")
+    parser.add_argument("--super_max_vel", type=float, default=None,
+                        help="Override SUPER super_planner.boundary.max_vel (m/s) before launching each scene")
     parser.add_argument("--goal_reach_dist", type=float, default=2.0,
                         help="Treat trajectory as complete when current position is within this distance to goal")
     parser.add_argument("--goal_timeout", type=float, default=40.0,

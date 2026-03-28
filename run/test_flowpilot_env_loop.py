@@ -192,20 +192,32 @@ def sample_start_goal_world(
     planner,
     min_goal_dist: float,
     max_goal_dist: float,
+    goal_z: float = 2.0,
     max_tries: int = 300,
 ) -> Tuple[WorldState, np.ndarray]:
-    """Sample collision-free start/goal using Flightmare reset + planner.isFree."""
+    """Sample start/goal following run_yopo.py test_policy pattern.
+
+    Start: one env.reset().
+    Goal:  +x forward (random dist in [min_goal_dist, max_goal_dist]),
+           random lateral y offset, fixed height z — same idea as run_yopo test_policy
+           (x=20, y=20*uniform(-1,1)+20, z=2) but relative to start.
+    """
     for _ in range(max_tries):
         obs_s = env.reset()
-        sp, sv, sa = obs_to_world_pva(obs_s)
-        obs_g = env.reset()
-        gp, _, _ = obs_to_world_pva(obs_g)
-        dist = np.linalg.norm(gp - sp)
-        if not (min_goal_dist <= dist <= max_goal_dist):
+        sp, _, _ = obs_to_world_pva(obs_s)
+        if not planner.isFree(sp):
             continue
-        if (not planner.isFree(sp)) or (not planner.isFree(gp)):
+        fwd = float(np.random.uniform(min_goal_dist, max_goal_dist))
+        lat = float(np.random.uniform(-1.0, 1.0)) * fwd * 0.5
+        gp = np.array([sp[0] + fwd, sp[1] + lat, goal_z], dtype=np.float64)
+        if not planner.isFree(gp):
             continue
-        cur = WorldState(pos=sp, vel=sv, acc=sa, jerk=np.zeros(3, dtype=np.float64))
+        cur = WorldState(
+            pos=sp,
+            vel=np.zeros(3, dtype=np.float64),
+            acc=np.zeros(3, dtype=np.float64),
+            jerk=np.zeros(3, dtype=np.float64),
+        )
         return cur, gp
     return None, None
 
@@ -335,7 +347,7 @@ def main():
 
     if args.spawn_trees_before_reset:
         print("[dbg] spawning trees before first reset...", flush=True)
-        env.spawnTreesAndSavePointcloud(args.scene_id, spacing=3.16)
+        env.spawnTreesAndSavePointcloud(args.scene_id, spacing=4)
         env.render()
         print("[dbg] spawn trees done", flush=True)
 

@@ -59,6 +59,10 @@ safe_flight_z: 1.5
 # Use 0.3 for conservative clearance in dense trees.
 super_robot_r: 0.3
 
+# Override SUPER max velocity (super_planner.boundary.max_vel) before each scene launch.
+# Default in click_smooth_ros1.yaml is 5.0 m/s.
+super_max_vel: 3.0
+
 # Occupancy check radius used for start/goal sampling only (not post-execution filter).
 # SUPER's own planner guarantees obstacle avoidance; PLY-based post-execution check
 # produces false rejections because PLY geometry is denser than SUPER's ROG-Map voxels.
