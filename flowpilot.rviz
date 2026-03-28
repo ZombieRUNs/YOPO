@@ -91,7 +91,7 @@ Visualization Manager:
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: true
-      Value: true
+      Value: false
     - Class: rviz/Group
       Displays:
         - Alpha: 1
