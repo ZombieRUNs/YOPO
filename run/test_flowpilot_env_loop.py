@@ -347,7 +347,7 @@ def main():
 
     if args.spawn_trees_before_reset:
         print("[dbg] spawning trees before first reset...", flush=True)
-        env.spawnTreesAndSavePointcloud(args.scene_id, spacing=4)
+        env.spawnTreesAndSavePointcloud(args.scene_id, spacing=3.5)
         env.render()
         print("[dbg] spawn trees done", flush=True)
 
