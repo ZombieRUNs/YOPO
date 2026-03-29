@@ -84,9 +84,9 @@ Visualization Manager:
       Position Transformer: XYZ
       Queue Size: 10
       Selectable: true
-      Size (Pixels): 2
-      Size (m): 0.05000000074505806
-      Style: Points
+      Size (Pixels): 3
+      Size (m): 0.05999999865889549
+      Style: Boxes
       Topic: /local_map
       Unreliable: false
       Use Fixed Frame: true

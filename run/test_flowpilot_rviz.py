@@ -417,7 +417,6 @@ def main():
     if os.path.exists(ply_path):
         try:
             pts = _load_ply_xyz(ply_path)
-            pts = _voxel_downsample(pts, voxel_size=0.3)
             map_header = Header()
             map_header.stamp = rospy.Time.now()
             map_header.frame_id = 'world'
