@@ -256,8 +256,23 @@ def infer_one_step(model, vae_encoder, basis, scheduler,
 
 
 # ---------------------------------------------------------------------------
-# PLY loader (numpy only, no open3d dependency)
+# PLY loader + voxel downsample (numpy only, no open3d dependency)
 # ---------------------------------------------------------------------------
+
+def _voxel_downsample(pts: np.ndarray, voxel_size: float = 0.3) -> np.ndarray:
+    """Keep one point per voxel cell. pts: [N,3] float32."""
+    if len(pts) == 0:
+        return pts
+    idx = np.floor(pts / voxel_size).astype(np.int32)
+    # Pack 3D voxel index into a single int64 key for np.unique
+    mn = idx.min(axis=0)
+    idx -= mn
+    mx = idx.max(axis=0) + 1
+    keys = idx[:, 0].astype(np.int64) * int(mx[1]) * int(mx[2]) \
+         + idx[:, 1].astype(np.int64) * int(mx[2]) \
+         + idx[:, 2].astype(np.int64)
+    _, first = np.unique(keys, return_index=True)
+    return pts[first]
 
 def _load_ply_xyz(path: str) -> np.ndarray:
     """Read xyz points from a binary or ASCII PLY file. Returns [N,3] float32."""
@@ -394,7 +409,7 @@ def main():
     wb = env.world_box.astype(np.float64)
     print(f'[env] scene {args.scene_id} ready, world_box={wb.tolist()}')
 
-    env.spawnTreesAndSavePointcloud(args.scene_id, spacing=3.5)
+    env.spawnTreesAndSavePointcloud(args.scene_id, spacing=4.0)
     env.render()
 
     # --- Publish scene point cloud (latched, published once) ---
@@ -402,6 +417,7 @@ def main():
     if os.path.exists(ply_path):
         try:
             pts = _load_ply_xyz(ply_path)
+            pts = _voxel_downsample(pts, voxel_size=0.3)
             map_header = Header()
             map_header.stamp = rospy.Time.now()
             map_header.frame_id = 'world'
