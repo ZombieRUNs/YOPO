@@ -48,13 +48,15 @@ from visualization_msgs.msg import Marker
 _goal_lock = threading.Lock()
 _goal_pos_world: np.ndarray = None   # [3] set when first goal arrives
 _goal_received: bool = False
+_goal_seq: int = 0
 
 
 def _callback_set_goal(msg: PoseStamped):
-    global _goal_pos_world, _goal_received
+    global _goal_pos_world, _goal_received, _goal_seq
     with _goal_lock:
         _goal_pos_world = np.array([msg.pose.position.x, msg.pose.position.y, 2.0])
         _goal_received = True
+        _goal_seq += 1
     print(f'[RViz] New goal: ({_goal_pos_world[0]:.1f}, {_goal_pos_world[1]:.1f}, 2.0)')
 
 
@@ -345,6 +347,10 @@ def parse_args():
     p.add_argument('--v_cmd',             type=float, default=6.0)
     p.add_argument('--scene_id',          type=int, default=0)
     p.add_argument('--goal_reach_dist',   type=float, default=2.0)
+    p.add_argument('--hover_rate_hz',     type=float, default=20.0,
+                   help='Render/publish rate while hovering at target.')
+    p.add_argument('--real_time',         action='store_true',
+                   help='Publish/render depth in real-time cadence using trajectory sample rate (e.g. 30Hz).')
     p.add_argument('--camera_pitch_deg',  type=float, default=-15.0)
     p.add_argument('--compile_model',     action='store_true')
     p.add_argument('--launch_unity',      action='store_true',
@@ -354,7 +360,7 @@ def parse_args():
 
 def main():
     faulthandler.enable(all_threads=True)
-    global _goal_pos_world, _goal_received
+    global _goal_pos_world, _goal_received, _goal_seq
 
     args = parse_args()
     script_dir = Path(__file__).resolve().parent
@@ -445,6 +451,8 @@ def main():
 
     basis     = BernsteinActionBasis(degree=7, T=1.6, num_waypoints=48, hz=30, device=args.device)
     scheduler = FlowMatchScheduler(num_train_timesteps=1000, shift=5.0)
+    traj_hz = float(getattr(basis, 'hz', basis.num_waypoints / basis.T))
+    traj_dt = 1.0 / max(1e-3, traj_hz)
 
     astats   = torch.load(ckpt(args.action_stats_path), map_location=args.device, weights_only=True)
     cstats   = torch.load(ckpt(args.coeff_stats_path),  map_location=args.device, weights_only=True)
@@ -475,6 +483,7 @@ def main():
         with _goal_lock:
             goal_ready = _goal_received
             goal_pos   = _goal_pos_world.copy() if _goal_received else None
+            goal_seq   = _goal_seq
         if not goal_ready:
             time.sleep(0.1)
             continue
@@ -505,11 +514,13 @@ def main():
               f'goal=({goal_pos[0]:.1f},{goal_pos[1]:.1f},{goal_pos[2]:.1f})')
 
         loop_idx = 0
+        last_quat_render = quat_render.copy()
         while not rospy.is_shutdown():
             # Check for new goal mid-trajectory
             with _goal_lock:
-                if _goal_pos_world is not goal_pos:
-                    goal_pos   = _goal_pos_world.copy()
+                if _goal_received and _goal_seq != goal_seq:
+                    goal_seq = _goal_seq
+                    goal_pos = _goal_pos_world.copy()
                     print(f'[run] goal updated mid-traj: ({goal_pos[0]:.1f},{goal_pos[1]:.1f})')
 
             # Inference
@@ -540,6 +551,8 @@ def main():
 
             # Rollout in Flightmare
             exec_n = min(args.rollout_points, wp_world.shape[0])
+            if args.real_time:
+                step_deadline = time.perf_counter()
             for k in range(exec_n):
                 pk = wp_world[k, 0:3]
                 vk = wp_world[k, 3:6]
@@ -554,11 +567,18 @@ def main():
                 env.setState(pk, vk, ak, quat_k)
                 env.render()
                 cond_depth = env.getDepthImage()[0][0].astype(np.float32)
+                last_quat_render = quat_k.copy()
 
                 # Publish depth + drone pose to RViz at each render step
                 publish_depth(depth_pub, cond_depth)
                 publish_drone_marker(marker_pub, pk, quat_k)
                 broadcast_tf(tf_br, pk, quat_k)
+
+                if args.real_time:
+                    step_deadline += traj_dt
+                    sleep_t = step_deadline - time.perf_counter()
+                    if sleep_t > 0.0:
+                        time.sleep(sleep_t)
 
             # Advance state to last executed point
             last = wp_world[exec_n - 1]
@@ -568,11 +588,34 @@ def main():
 
             dist = float(np.linalg.norm(goal_pos - cur.pos))
             if dist < args.goal_reach_dist:
-                print(f'[run] arrived! dist={dist:.2f}m. Waiting for next goal...')
-                with _goal_lock:
-                    _goal_received = False
-                    _goal_pos_world = None
-                break  # cur keeps last position; next goal starts from here
+                print(f'[run] arrived! dist={dist:.2f}m. Enter hover mode (waiting new goal).')
+                hover_dt = 1.0 / max(1e-3, float(args.hover_rate_hz))
+                hover_vel = np.zeros(3, dtype=np.float64)
+                hover_acc = np.zeros(3, dtype=np.float64)
+                hover_jerk = np.zeros(3, dtype=np.float64)
+
+                while not rospy.is_shutdown():
+                    with _goal_lock:
+                        if _goal_received and _goal_seq != goal_seq:
+                            goal_seq = _goal_seq
+                            goal_pos = _goal_pos_world.copy()
+                            print(f'[run] leave hover, new goal=({goal_pos[0]:.1f},{goal_pos[1]:.1f})')
+                            break
+
+                    # Hold at last feasible state instead of cutting execution.
+                    env.setState(cur.pos, hover_vel, hover_acc, last_quat_render)
+                    env.render()
+                    cond_depth = env.getDepthImage()[0][0].astype(np.float32)
+
+                    publish_depth(depth_pub, cond_depth)
+                    publish_drone_marker(marker_pub, cur.pos, last_quat_render)
+                    publish_goal_marker(goal_pub, goal_pos)
+                    broadcast_tf(tf_br, cur.pos, last_quat_render)
+
+                    cur = WorldState(pos=cur.pos.copy(), vel=hover_vel.copy(),
+                                     acc=hover_acc.copy(), jerk=hover_jerk.copy())
+                    time.sleep(hover_dt)
+                break
 
             loop_idx += 1
 

@@ -582,7 +582,7 @@ def main(args):
             # ---- Rebuild Flightmare scene and use its generated PLY as source of truth ----
             print(f"[scene {scene_id:03d}] Loading Flightmare scene ...", flush=True)
             env.setMapID(np.array([scene_id]))
-            env.spawnTreesAndSavePointcloud(scene_id, spacing=3.16)
+            env.spawnTreesAndSavePointcloud(scene_id, spacing=4.0)
             runtime_ply_path = os.path.join(YOPO_SIM_DIR, f"pointcloud-{scene_id}.ply")
             ply_path = runtime_ply_path if os.path.exists(runtime_ply_path) else legacy_ply_path
             if ply_path == legacy_ply_path:
