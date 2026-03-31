@@ -1,0 +1,69 @@
+# Collect SUPER trajectory dataset
+# Mirrors collect_gcopter_trajs.yaml but targets the SUPER planner.
+# Run from YOPO/run/ (inside Docker):
+#   python collect_super_trajs.py
+#   python collect_super_trajs.py --num_scenes=2 --trajs_per_scene=5   # quick test
+
+num_scenes:      36        # reuse all 36 YOPO dataset scenes
+trajs_per_scene: 20
+
+# Input: existing gcopter_trajs dataset (contains pointcloud.ply per scene)
+gcopter_trajs_root: dataset/gcopter_trajs
+
+# Output
+save_root: dataset/super_trajs
+
+# Depth + RGB resolution
+img_width:  160
+img_height: 96
+
+# Start/goal Euclidean distance constraints (meters).
+# SUPER planning_horizon=7m so goals farther away trigger replanning;
+# trajectories in the dataset are the first-segment plans (~7m).
+min_dist: 30.0
+max_dist: 40.0
+
+rgb_fps: 30.0
+camera_pitch_deg: -15.0
+
+# --- SUPER-specific ---
+
+# Seconds to wait after odometry appears for ROG-Map to finish loading PCD.
+# ~3M-point clouds at 0.1m resolution take 5-10s on typical hardware.
+startup_wait: 10.0
+
+# Seconds to wait for /planning_cmd/poly_traj after sending /goal.
+plan_timeout: 15.0
+
+# Extra buffer (seconds) added after each replan segment before goal-distance check.
+exec_buffer: 2.0
+
+# Consider one trajectory complete when odometry is within this distance to goal.
+goal_reach_dist: 0.5
+
+# Max wall-clock seconds allowed for one goal (across multiple replans).
+goal_timeout: 60.0
+
+# Max number of /planning_cmd/poly_traj segments to stitch for one saved trajectory.
+max_replan_segments: 20
+
+# Teleport drone to a fresh random start position every N trajectories
+# to ensure scene-wide coverage (otherwise trajectories chain from goal to goal).
+reset_interval: 5
+
+# Clamp all sampled init/start/goal z to a safe fixed flight height for SUPER.
+# Avoids goals near virtual_ceil_height causing corridor generation failure.
+safe_flight_z: 1.5
+
+# Override SUPER planner safety radius (super_planner.robot_r) before each scene launch.
+# Use 0.3 for conservative clearance in dense trees.
+super_robot_r: 0.3
+
+# Override SUPER max velocity (super_planner.boundary.max_vel) before each scene launch.
+# Default in click_smooth_ros1.yaml is 5.0 m/s.
+super_max_vel: 3.0
+
+# Occupancy check radius used for start/goal sampling only (not post-execution filter).
+# SUPER's own planner guarantees obstacle avoidance; PLY-based post-execution check
+# produces false rejections because PLY geometry is denser than SUPER's ROG-Map voxels.
+collision_check_r: 0.3
