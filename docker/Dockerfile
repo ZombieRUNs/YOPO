@@ -41,7 +41,7 @@ ENV ROS_DISTRO=noetic
 SHELL ["/bin/bash", "-c"]
 RUN echo "source /opt/ros/noetic/setup.bash" >> /root/.bashrc
 
-# ---- 3. Miniconda (Python 3.8 env) ----
+# ---- 3. Miniconda (Python 3.10 env for newer PyTorch/Blackwell support) ----
 RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh \
     && bash /tmp/miniconda.sh -b -p /opt/conda \
     && rm /tmp/miniconda.sh
@@ -49,18 +49,23 @@ ENV PATH=/opt/conda/bin:$PATH
 
 RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
     && conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r \
-    && conda create -y -n yopo python=3.8 && conda clean -ya
+    && conda create -y -n yopo python=3.10 && conda clean -ya
 ENV CONDA_DEFAULT_ENV=yopo
 ENV PATH=/opt/conda/envs/yopo/bin:$PATH
 
-# ---- 4. Python dependencies (README spec) ----
+# ---- 4. Python dependencies ----
+# PyTorch 2.7.x + CUDA 12.8 is the first official wheel line with Blackwell support.
 RUN pip install --no-cache-dir \
-    torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
-    --index-url https://download.pytorch.org/whl/cu118
+    torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
+    --index-url https://download.pytorch.org/whl/cu128
 
 RUN pip install --no-cache-dir "pip==23.3.2" "setuptools==65.5.0" "wheel==0.38.4" \
     && pip install --no-cache-dir \
     opencv-python \
+    "einops>=0.7" \
+    "omegaconf>=2.3" \
+    "hydra-core>=1.3" \
+    imageio \
     "gym==0.21.0" \
     "stable-baselines3==1.5.0" \
     "scipy==1.10.1" \
