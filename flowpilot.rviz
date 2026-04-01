@@ -4,9 +4,11 @@ Panels:
     Name: Displays
     Property Tree Widget:
       Expanded:
+        - /PointCloud21
         - /PointCloud21/Autocompute Value Bounds1
         - /Traj1
         - /Traj1/BestTraj1
+        - /PointCloud22
       Splitter Ratio: 0.5
     Tree Height: 409
   - Class: rviz/Selection
@@ -74,7 +76,7 @@ Visualization Manager:
       Channel Name: intensity
       Class: rviz/PointCloud2
       Color: 255; 255; 255
-      Color Transformer: AxisColor
+      Color Transformer: Intensity
       Decay Time: 0
       Enabled: true
       Invert Rainbow: false
@@ -97,8 +99,8 @@ Visualization Manager:
         - Alpha: 1
           Autocompute Intensity Bounds: true
           Autocompute Value Bounds:
-            Max Value: 2.220285415649414
-            Min Value: 1.7507511377334595
+            Max Value: 2.0672051906585693
+            Min Value: 1.7573436498641968
             Value: true
           Axis: Z
           Channel Name: intensity
@@ -132,6 +134,42 @@ Visualization Manager:
         drone: true
       Queue Size: 100
       Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /flowpilot/vel_marker
+      Name: Velocity
+      Namespaces:
+        velocity: true
+      Queue Size: 10
+      Value: true
+    - Alpha: 0.30000001192092896
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 11.34522533416748
+        Min Value: 1.9320673942565918
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: AxisColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: PointCloud2
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.5
+      Style: Flat Squares
+      Topic: /flowpilot/local_cloud
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 255; 255; 255
@@ -160,7 +198,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 90.66800689697266
+      Distance: 140.23304748535156
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -176,9 +214,9 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.1947965621948242
+      Pitch: 0.8997969031333923
       Target Frame: world
-      Yaw: 3.1181490421295166
+      Yaw: 3.1431498527526855
     Saved: ~
 Window Geometry:
   Displays:

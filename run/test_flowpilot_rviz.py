@@ -205,6 +205,30 @@ def publish_drone_marker(pub: rospy.Publisher, pos: np.ndarray, quat_wxyz: np.nd
     pub.publish(m)
 
 
+def publish_vel_marker(pub: rospy.Publisher, pos: np.ndarray, vel: np.ndarray,
+                       frame_id: str = 'world'):
+    """Publish a text marker showing current speed (m/s) above the drone."""
+    speed = float(np.linalg.norm(vel))
+    m = Marker()
+    m.header.stamp = rospy.Time.now()
+    m.header.frame_id = frame_id
+    m.ns = 'velocity'
+    m.id = 2
+    m.type = Marker.TEXT_VIEW_FACING
+    m.action = Marker.ADD
+    m.pose.position.x = float(pos[0])
+    m.pose.position.y = float(pos[1])
+    m.pose.position.z = float(pos[2]) + 5.5   # float well above the drone
+    m.pose.orientation.w = 1.0
+    m.scale.z = 3.0    # text height in metres
+    m.text = f'{speed:.1f} m/s'
+    m.color.r = 0.0
+    m.color.g = 0.0
+    m.color.b = 0.0
+    m.color.a = 1.0
+    pub.publish(m)
+
+
 def publish_goal_marker(pub: rospy.Publisher, goal: np.ndarray, frame_id: str = 'world'):
     """Publish a cylinder marker at goal position."""
     m = Marker()
@@ -237,6 +261,94 @@ def broadcast_tf(br: tf2_ros.TransformBroadcaster, pos: np.ndarray,
     t.transform.rotation.y = float(quat_wxyz[2])
     t.transform.rotation.z = float(quat_wxyz[3])
     br.sendTransform(t)
+
+
+# ---------------------------------------------------------------------------
+# Local depth point cloud (back-project depth image → colored world-frame cloud)
+# ---------------------------------------------------------------------------
+# Camera intrinsics: 160×96 image, 90° horizontal FOV → fx = fy = 80
+# Depth from getDepthImage() is normalized [0,1] where 1.0 = 20 m.
+# Body-frame convention: x=forward, y=left, z=up.
+# Camera axes: z_cam=forward (=body x), x_cam=right (=body -y), y_cam=down (=body -z).
+_CAM_FX: float = 80.0
+_CAM_FY: float = 80.0
+_CAM_CX: float = 79.5
+_CAM_CY: float = 47.5
+_CAM_MAX_M: float = 20.0   # normalization range used by getDepthImage()
+
+
+def depth_to_local_cloud_msg(depth_01: np.ndarray,
+                              pos: np.ndarray,
+                              quat_wxyz: np.ndarray,
+                              vis_max_m: float = 8.0,
+                              skip: int = 3,
+                              frame_id: str = 'world'):
+    """Back-project a normalized [0,1] depth image to a colored PointCloud2.
+
+    Color encodes metric depth: blue (near) → green (mid) → red (far).
+    Returns None when no valid pixels remain.
+    """
+    H, W = depth_01.shape
+    us = np.arange(0, W, skip, dtype=np.int32)
+    vs = np.arange(0, H, skip, dtype=np.int32)
+    uu, vv = np.meshgrid(us, vs)
+    uu = uu.ravel()
+    vv = vv.ravel()
+
+    # Denormalize to metres
+    dd = depth_01[vv, uu] * _CAM_MAX_M
+    valid = (dd > 0.2) & (dd < vis_max_m) & np.isfinite(dd)
+    uu, vv, dd = uu[valid], vv[valid], dd[valid]
+    if len(dd) == 0:
+        return None
+
+    # Back-project to body frame: [forward, left, up] = [d, -x_c, -y_c]
+    x_c = (uu.astype(np.float32) - _CAM_CX) / _CAM_FX * dd
+    y_c = (vv.astype(np.float32) - _CAM_CY) / _CAM_FY * dd
+    pts_body = np.stack([dd, -x_c, -y_c], axis=1)   # [N, 3]
+
+    # Rotate body → world, then translate
+    R_wb = quat_to_rot(quat_wxyz)
+    pts_w = (R_wb @ pts_body.T).T + pos              # [N, 3]
+
+    # Distance-based colormap: blue → green → red
+    t = np.clip(dd / vis_max_m, 0.0, 1.0)
+    r_ch = np.clip(255.0 * (2.0 * t - 1.0),          0, 255).astype(np.uint8)
+    g_ch = np.clip(255.0 * (1.0 - np.abs(2.0*t-1.0)),0, 255).astype(np.uint8)
+    b_ch = np.clip(255.0 * (1.0 - 2.0 * t),           0, 255).astype(np.uint8)
+    rgb_u32 = (r_ch.astype(np.uint32) << 16
+               | g_ch.astype(np.uint32) << 8
+               | b_ch.astype(np.uint32))
+
+    # Pack as PointCloud2 with XYZRGB layout
+    N = len(dd)
+    buf = np.zeros(N, dtype=[('x', np.float32), ('y', np.float32),
+                              ('z', np.float32), ('rgb', np.float32)])
+    buf['x'] = pts_w[:, 0].astype(np.float32)
+    buf['y'] = pts_w[:, 1].astype(np.float32)
+    buf['z'] = pts_w[:, 2].astype(np.float32)
+    buf['rgb'] = rgb_u32.view(np.float32)
+
+    fields = [
+        PointField('x',   0, PointField.FLOAT32, 1),
+        PointField('y',   4, PointField.FLOAT32, 1),
+        PointField('z',   8, PointField.FLOAT32, 1),
+        PointField('rgb', 12, PointField.FLOAT32, 1),
+    ]
+    header = Header()
+    header.stamp = rospy.Time.now()
+    header.frame_id = frame_id
+    msg = PointCloud2()
+    msg.header      = header
+    msg.height      = 1
+    msg.width       = N
+    msg.fields      = fields
+    msg.is_bigendian = False
+    msg.point_step  = 16
+    msg.row_step    = 16 * N
+    msg.data        = buf.tobytes()
+    msg.is_dense    = True
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +565,7 @@ def parse_args():
     p.add_argument('--compile_model',     action='store_true')
     p.add_argument('--launch_unity',      action='store_true',
                    help='Auto-launch flightmare.x86_64 before connecting')
+    p.add_argument("--num_layers", type=int, default=12, help="Number of MoT transformer layers in FlowPilotPhase2.")
     return p.parse_args()
 
 
@@ -468,11 +581,13 @@ def main():
 
     # --- ROS init ---
     rospy.init_node('flowpilot_rviz', anonymous=False)
-    traj_pub   = rospy.Publisher('/flowpilot/best_traj_visual', PointCloud2, queue_size=1)
-    map_pub    = rospy.Publisher('/local_map',                  PointCloud2, queue_size=1, latch=True)
-    depth_pub  = rospy.Publisher('/depth_image',                Image,       queue_size=1)
-    marker_pub = rospy.Publisher('/uav_mesh',                   Marker,      queue_size=1)
-    goal_pub   = rospy.Publisher('/flowpilot/goal_marker',      Marker,      queue_size=1)
+    traj_pub        = rospy.Publisher('/flowpilot/best_traj_visual', PointCloud2, queue_size=1)
+    map_pub         = rospy.Publisher('/local_map',                  PointCloud2, queue_size=1, latch=True)
+    local_cloud_pub = rospy.Publisher('/flowpilot/local_cloud',      PointCloud2, queue_size=1)
+    depth_pub       = rospy.Publisher('/depth_image',                Image,       queue_size=1)
+    marker_pub      = rospy.Publisher('/uav_mesh',                   Marker,      queue_size=1)
+    vel_pub         = rospy.Publisher('/flowpilot/vel_marker',       Marker,      queue_size=1)
+    goal_pub        = rospy.Publisher('/flowpilot/goal_marker',      Marker,      queue_size=1)
     rospy.Subscriber('/move_base_simple/goal', PoseStamped, _callback_set_goal, queue_size=1)
     tf_br = tf2_ros.TransformBroadcaster()
 
@@ -523,11 +638,12 @@ def main():
     if os.path.exists(ply_path):
         try:
             pts = _load_ply_xyz(ply_path)
+            pts = _voxel_downsample(pts, voxel_size=0.3)   # sparse global map for RViz
             map_header = Header()
             map_header.stamp = rospy.Time.now()
             map_header.frame_id = 'world'
             map_pub.publish(point_cloud2.create_cloud_xyz32(map_header, pts))
-            print(f'[map] published {len(pts)} points from {ply_path}')
+            print(f'[map] published {len(pts)} points from {ply_path} (voxel 1.0m)')
         except Exception as e:
             print(f'[map] failed to load/publish pointcloud: {e}')
     else:
@@ -535,7 +651,7 @@ def main():
 
     # --- Model ---
     model = FlowPilotPhase2(
-        num_layers=12, d_video=512, d_action=256, num_heads=8,
+        num_layers=args.num_layers, d_video=512, d_action=256, num_heads=8,
         ffn_dim_video=2048, ffn_dim_action=1024, z_dim=48,
         num_actions=5, latent_t=3, grid_h=6, grid_w=10,
     ).to(args.device)
@@ -672,7 +788,11 @@ def main():
                 # Publish depth + drone pose to RViz at each render step
                 publish_depth(depth_pub, cond_depth)
                 publish_drone_marker(marker_pub, pk, quat_k)
+                publish_vel_marker(vel_pub, pk, vk)
                 broadcast_tf(tf_br, pk, quat_k)
+                local_msg = depth_to_local_cloud_msg(cond_depth, pk, quat_k)
+                if local_msg is not None:
+                    local_cloud_pub.publish(local_msg)
 
                 if args.real_time:
                     step_deadline += traj_dt
@@ -711,6 +831,9 @@ def main():
                     publish_drone_marker(marker_pub, cur.pos, last_quat_render)
                     publish_goal_marker(goal_pub, goal_pos)
                     broadcast_tf(tf_br, cur.pos, last_quat_render)
+                    local_msg = depth_to_local_cloud_msg(cond_depth, cur.pos, last_quat_render)
+                    if local_msg is not None:
+                        local_cloud_pub.publish(local_msg)
 
                     cur = WorldState(pos=cur.pos.copy(), vel=hover_vel.copy(),
                                      acc=hover_acc.copy(), jerk=hover_jerk.copy())

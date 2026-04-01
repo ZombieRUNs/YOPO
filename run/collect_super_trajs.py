@@ -116,7 +116,10 @@ def load_super_runtime_params():
     return {"robot_r": robot_r, "click_height": click_h}
 
 
-def update_super_scene(scene_id: int, init_pos, pcd_dir: str, super_robot_r=None, super_max_vel=None) -> None:
+def update_super_scene(scene_id: int, init_pos, pcd_dir: str, super_robot_r=None, super_max_vel=None,
+                       super_planning_horizon=None, super_receding_dis=None,
+                       super_corridor_line_max_length=None,
+                       super_safe_corridor_line_max_length=None, super_corridor_bound_dis=None) -> None:
     """Update symlink + both YAML configs for a new scene."""
     pcd_src = os.path.join(pcd_dir, f"scene_{scene_id:03d}.pcd")
 
@@ -134,13 +137,23 @@ def update_super_scene(scene_id: int, init_pos, pcd_dir: str, super_robot_r=None
     cfg["init_position"]["z"] = float(init_pos[2])
     _yaml_dump_rw(cfg, SUPER_CLICK_CFG)
 
-    # click_smooth_ros1.yaml — rog_map.pcd_name
+    # click_smooth_ros1.yaml — rog_map.pcd_name + planner overrides
     cfg2 = _yaml_load_rw(SUPER_PLANNER_CFG)
     cfg2["rog_map"]["pcd_name"] = pcd_src
     if super_robot_r is not None:
         cfg2["super_planner"]["robot_r"] = float(super_robot_r)
     if super_max_vel is not None:
         cfg2["traj_opt"]["boundary"]["max_vel"] = float(super_max_vel)
+    if super_planning_horizon is not None:
+        cfg2["super_planner"]["planning_horizon"] = float(super_planning_horizon)
+    if super_receding_dis is not None:
+        cfg2["super_planner"]["receding_dis"] = float(super_receding_dis)
+    if super_corridor_line_max_length is not None:
+        cfg2["super_planner"]["corridor_line_max_length"] = float(super_corridor_line_max_length)
+    if super_safe_corridor_line_max_length is not None:
+        cfg2["super_planner"]["safe_corridor_line_max_length"] = float(super_safe_corridor_line_max_length)
+    if super_corridor_bound_dis is not None:
+        cfg2["super_planner"]["corridor_bound_dis"] = float(super_corridor_bound_dis)
     _yaml_dump_rw(cfg2, SUPER_PLANNER_CFG)
 
 
@@ -611,7 +624,12 @@ def main(args):
 
             # ---- Update SUPER configs ----
             update_super_scene(scene_id, init_pos, SUPER_FOREST_DIR,
-                               super_robot_r=super_robot_r, super_max_vel=args.super_max_vel)
+                               super_robot_r=super_robot_r, super_max_vel=args.super_max_vel,
+                               super_planning_horizon=args.super_planning_horizon,
+                               super_receding_dis=args.super_receding_dis,
+                               super_corridor_line_max_length=args.super_corridor_line_max_length,
+                               super_safe_corridor_line_max_length=args.super_safe_corridor_line_max_length,
+                               super_corridor_bound_dis=args.super_corridor_bound_dis)
 
             # ---- Launch SUPER ----
             if ros_proc is not None:
@@ -659,7 +677,7 @@ def main(args):
 
                 # Teleport if too many consecutive failures (drone likely stuck)
                 # or every reset_interval successful trajectories.
-                need_teleport = (consec_failures >= 5) or \
+                need_teleport = (consec_failures >= 2) or \
                                 (traj_count > 0 and traj_count % args.reset_interval == 0)
                 if need_teleport:
                     for _ in range(200):
@@ -719,7 +737,7 @@ def main(args):
                 if not reached_goal:
                     consec_failures += 1
                     print(f"  [attempt {attempts}] did not reach goal (remain={dist_to_goal:.2f}m), skip"
-                          f"{' [teleport next]' if consec_failures >= 5 else ''}", flush=True)
+                          f"{' [teleport next]' if consec_failures >= 2 else ''}", flush=True)
                     continue
 
                 cmd_hist = collector.get_cmd_history()
@@ -763,6 +781,12 @@ def main(args):
                         "goal_reach_dist": args.goal_reach_dist,
                         "goal_remain_dist": dist_to_goal,
                         "super_robot_r": super_robot_r,
+                        "super_max_vel": args.super_max_vel,
+                        "super_planning_horizon": args.super_planning_horizon,
+                        "super_receding_dis": args.super_receding_dis,
+                        "super_corridor_line_max_length": args.super_corridor_line_max_length,
+                        "super_safe_corridor_line_max_length": args.super_safe_corridor_line_max_length,
+                        "super_corridor_bound_dis": args.super_corridor_bound_dis,
                         "collision_check_r": args.collision_check_r,
                         "waypoint_source": "planning_pos_cmd",
                         "dt":             DT,
@@ -859,7 +883,17 @@ def parse_args():
     parser.add_argument("--super_robot_r", type=float, default=None,
                         help="Override SUPER super_planner.robot_r before launching each scene")
     parser.add_argument("--super_max_vel", type=float, default=None,
-                        help="Override SUPER super_planner.boundary.max_vel (m/s) before launching each scene")
+                        help="Override SUPER traj_opt.boundary.max_vel (m/s) before launching each scene")
+    parser.add_argument("--super_planning_horizon", type=float, default=None,
+                        help="Override SUPER super_planner.planning_horizon (m) before launching each scene")
+    parser.add_argument("--super_receding_dis", type=float, default=None,
+                        help="Override SUPER super_planner.receding_dis (m) before launching each scene")
+    parser.add_argument("--super_corridor_line_max_length", type=float, default=None,
+                        help="Override SUPER super_planner.corridor_line_max_length (m) before launching each scene")
+    parser.add_argument("--super_safe_corridor_line_max_length", type=float, default=None,
+                        help="Override SUPER super_planner.safe_corridor_line_max_length (m) before launching each scene")
+    parser.add_argument("--super_corridor_bound_dis", type=float, default=None,
+                        help="Override SUPER super_planner.corridor_bound_dis (m) before launching each scene")
     parser.add_argument("--goal_reach_dist", type=float, default=2.0,
                         help="Treat trajectory as complete when current position is within this distance to goal")
     parser.add_argument("--goal_timeout", type=float, default=40.0,
