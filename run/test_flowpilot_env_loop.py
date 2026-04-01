@@ -270,6 +270,7 @@ def main():
     parser.add_argument("--depth_window_w", type=int, default=480, help="cv2 depth window width when --show_depth is enabled.")
     parser.add_argument("--depth_window_h", type=int, default=300, help="cv2 depth window height when --show_depth is enabled.")
     parser.add_argument("--camera_pitch_deg", type=float, default=0.0, help="Render-only camera pitch offset (deg). Applied in env.setState only.")
+    parser.add_argument("--num_layers", type=int, default=12, help="Number of MoT transformer layers in FlowPilotPhase2.")
     parser.add_argument("--compile_model", action="store_true", help="Enable torch.compile for FlowPilotPhase2 inference.")
     parser.add_argument(
         "--debug_stop_after",
@@ -347,7 +348,7 @@ def main():
 
     if args.spawn_trees_before_reset:
         print("[dbg] spawning trees before first reset...", flush=True)
-        env.spawnTreesAndSavePointcloud(args.scene_id, spacing=3.5)
+        env.spawnTreesAndSavePointcloud(args.scene_id, spacing=4.0)
         env.render()
         print("[dbg] spawn trees done", flush=True)
 
@@ -367,7 +368,7 @@ def main():
 
     # Load FlowPilot assets.
     model = FlowPilotPhase2(
-        num_layers=12, d_video=512, d_action=256, num_heads=8,
+        num_layers=args.num_layers, d_video=512, d_action=256, num_heads=8,
         ffn_dim_video=2048, ffn_dim_action=1024, z_dim=48,
         num_actions=5, latent_t=3, grid_h=6, grid_w=10,
     ).to(args.device)
