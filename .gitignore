@@ -49,6 +49,7 @@ run/dataset/
 
 # test trajectories
 run/flowpilot_env_loop/*
+run/poly-action-rw/
 
 # simulator workspace (ignore entire local catkin workspace)
 sim/
