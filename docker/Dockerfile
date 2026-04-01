@@ -37,6 +37,12 @@ RUN sh -c 'echo "deb http://packages.ros.org/ros/ubuntu $(lsb_release -sc) main"
     ros-noetic-image-transport \
     && rm -rf /var/lib/apt/lists/*
 
+# ---- 2.1 Gazebo Classic / Ignition packages for PX4 SITL ----
+# Mirror PX4's ubuntu.sh behavior on Ubuntu 20.04 by enabling the OSRF repo.
+RUN sh -c 'echo "deb http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -sc) main" > /etc/apt/sources.list.d/gazebo-stable.list' \
+    && wget -q http://packages.osrfoundation.org/gazebo.key -O - | apt-key add - \
+    && apt-get update
+
 ENV ROS_DISTRO=noetic
 SHELL ["/bin/bash", "-c"]
 RUN echo "source /opt/ros/noetic/setup.bash" >> /root/.bashrc
@@ -49,11 +55,13 @@ ENV PATH=/opt/conda/bin:$PATH
 
 RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
     && conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r \
-    && conda create -y -n yopo python=3.10 && conda clean -ya
+    && conda create -y -n yopo python=3.10 \
+    && conda create -y -n px4 python=3.10 \
+    && conda clean -ya
 ENV CONDA_DEFAULT_ENV=yopo
 ENV PATH=/opt/conda/envs/yopo/bin:$PATH
 
-# ---- 4. Python dependencies ----
+# ---- 4. YOPO Python dependencies ----
 # PyTorch 2.7.x + CUDA 12.8 is the first official wheel line with Blackwell support.
 RUN pip install --no-cache-dir \
     torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
@@ -78,6 +86,41 @@ RUN pip install --no-cache-dir "pip==23.3.2" "setuptools==65.5.0" "wheel==0.38.4
     empy \
     catkin_pkg \
     tqdm
+
+# ---- 4.1 PX4 Python dependencies (isolated env to avoid polluting YOPO) ----
+# PX4's upstream requirements.txt still contains the old pip-incompatible spec
+# `matplotlib>=3.0.*`, so install the equivalent cleaned dependency set here.
+RUN source /opt/conda/etc/profile.d/conda.sh \
+    && conda run -n px4 python -m pip install --no-cache-dir "pip==23.3.2" "setuptools==65.5.0" "wheel==0.38.4" \
+    && conda run -n px4 python -m pip install --no-cache-dir \
+    argcomplete \
+    cerberus \
+    coverage \
+    "empy==3.3.4" \
+    future \
+    "jinja2>=2.8" \
+    jsonschema \
+    kconfiglib \
+    lxml \
+    "matplotlib>=3.0" \
+    "numpy==1.26.4" \
+    "scipy==1.15.3" \
+    "nunavut>=1.1.0" \
+    packaging \
+    "pandas>=0.21" \
+    pkgconfig \
+    psutil \
+    pygments \
+    pymavlink \
+    pyros-genmsg \
+    pyserial \
+    "pyulog>=0.5.0" \
+    pyyaml \
+    requests \
+    "six>=1.12.0" \
+    "toml>=0.9" \
+    "sympy>=1.10.1" \
+    "symforce>=0.9.0"
 
 # ---- 5. Environment variables ----
 ENV FLIGHTMARE_PATH=/root/YOPO
@@ -112,6 +155,21 @@ else
   export FLIGHTMARE_PATH=/root/YOPO
 fi
 export PYTHONPATH="${FLIGHTMARE_PATH}:${FLIGHTMARE_PATH}/flightlib/build:${PYTHONPATH}"
+export PX4_AUTOPILOT_PATH=/root/workspace/PX4-Autopilot
+source /opt/conda/etc/profile.d/conda.sh
+alias activate_yopo='conda activate yopo'
+alias activate_px4='conda activate px4'
+
+# PX4 Gazebo Classic environment
+if [ -d "${PX4_AUTOPILOT_PATH}" ]; then
+  export ROS_PACKAGE_PATH="${ROS_PACKAGE_PATH}:${PX4_AUTOPILOT_PATH}"
+  export ROS_PACKAGE_PATH="${ROS_PACKAGE_PATH}:${PX4_AUTOPILOT_PATH}/Tools/simulation/gazebo-classic/sitl_gazebo-classic"
+  if [ -d "${PX4_AUTOPILOT_PATH}/build/px4_sitl_default" ]; then
+    source "${PX4_AUTOPILOT_PATH}/Tools/simulation/gazebo-classic/setup_gazebo.bash" \
+      "${PX4_AUTOPILOT_PATH}" \
+      "${PX4_AUTOPILOT_PATH}/build/px4_sitl_default"
+  fi
+fi
 EOF
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -122,11 +180,60 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-noetic-visualization-msgs \
     ros-noetic-rviz \
     ros-noetic-rqt-plot \
+    astyle \
+    cppcheck \
+    file \
+    gdb \
+    lcov \
+    libfuse2 \
+    libxml2-dev \
+    libxml2-utils \
+    ninja-build \
+    rsync \
+    shellcheck \
+    unzip \
+    zip \
+    ant \
+    openjdk-13-jre \
+    openjdk-13-jdk \
+    libvecmath-java \
+    bc \
+    dmidecode \
+    gazebo11 \
+    gazebo11-common \
+    gazebo11-plugin-base \
+    libgazebo11-dev \
+    libignition-common3 \
+    libignition-common3-dev \
+    libignition-common3-graphics \
+    libignition-common3-graphics-dev \
+    libignition-math6 \
+    libignition-math6-dev \
+    libignition-msgs5 \
+    libignition-msgs5-dev \
+    libignition-fuel-tools4 \
+    libignition-fuel-tools4-dev \
+    libignition-transport8 \
+    libignition-transport8-dev \
+    libignition-tools-dev \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libimage-exiftool-perl \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/lib/x86_64-linux-gnu/libffi.so.7.1.0 /opt/conda/envs/yopo/lib/libffi.so.7
 
 # Ensure ROS Python runtime deps are available in the active conda env.
 RUN pip install --no-cache-dir rospkg catkin_pkg
+
+# PX4 helper env stays isolated in its own conda environment.
+RUN source /opt/conda/etc/profile.d/conda.sh \
+    && conda run -n px4 python -m pip install --no-cache-dir rospkg catkin_pkg
 
 CMD ["/bin/bash"]
