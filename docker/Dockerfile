@@ -179,6 +179,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-noetic-geometry-msgs \
     ros-noetic-visualization-msgs \
     ros-noetic-rviz \
+    ros-noetic-gazebo-ros \
+    ros-noetic-gazebo-plugins \
+    ros-noetic-mavros \
+    ros-noetic-mavros-extras \
+    ros-noetic-ddynamic-reconfigure \
+    ros-noetic-rqt \
+    ros-noetic-rqt-graph \
+    ros-noetic-rqt-reconfigure \
     ros-noetic-rqt-plot \
     astyle \
     cppcheck \
@@ -199,6 +207,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvecmath-java \
     bc \
     dmidecode \
+    geographiclib-tools \
+    geographiclib-datasets \
     gazebo11 \
     gazebo11-common \
     gazebo11-plugin-base \
@@ -224,6 +234,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
     libimage-exiftool-perl \
+    python3-pyqt5 \
+    python3-pyqt5.qtsvg \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
@@ -235,5 +247,22 @@ RUN pip install --no-cache-dir rospkg catkin_pkg
 # PX4 helper env stays isolated in its own conda environment.
 RUN source /opt/conda/etc/profile.d/conda.sh \
     && conda run -n px4 python -m pip install --no-cache-dir rospkg catkin_pkg
+
+# Pre-install GeographicLib datasets so MAVROS can start without manual setup.
+RUN /opt/ros/noetic/lib/mavros/install_geographiclib_datasets.sh
+
+# Install OSQP system-wide for OMMPC.
+RUN git clone --recursive -b release-0.6.3 https://github.com/osqp/osqp.git /tmp/osqp \
+    && cmake -S /tmp/osqp -B /tmp/osqp/build -G "Unix Makefiles" \
+    && cmake --build /tmp/osqp/build \
+    && cmake --build /tmp/osqp/build --target install \
+    && ldconfig \
+    && rm -rf /tmp/osqp
+
+# PX4 source lives on the mounted workspace at runtime; trust these repos for root.
+RUN git config --global --add safe.directory /root/workspace/PX4-Autopilot \
+    && git config --global --add safe.directory /root/workspace/PX4-Autopilot/src/modules/mavlink/mavlink \
+    && git config --global --add safe.directory /root/workspace/PX4-Autopilot/platforms/nuttx/NuttX/nuttx \
+    && git config --global --add safe.directory /root/workspace/PX4-Autopilot/platforms/nuttx/NuttX/apps
 
 CMD ["/bin/bash"]
