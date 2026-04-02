@@ -549,7 +549,9 @@ def parse_args():
     p.add_argument('--flowpilot_root',    type=str, default='/root/workspace/YOPO/run/poly-action-rw')
     p.add_argument('--device',            type=str, default='cuda')
     p.add_argument('--phase2_ckpt',       type=str, default='/root/workspace/YOPO/run/poly-action-rw/ckpt/super/ckpt_final.pt')
-    p.add_argument('--vae_pth',           type=str, default='/root/workspace/YOPO/run/poly-action-rw/ckpt/super/Wan2.2_VAE.pth')
+    p.add_argument('--vae_pth',           type=str, default='/root/workspace/YOPO/run/poly-action-rw/ckpt/2026-3-24/Wan2.2_VAE.pth')
+    p.add_argument('--depth_encoder_ckpt', type=str, default='', help='If set, use lightweight DepthEncoder instead of Wan2.2 VAE.')
+    p.add_argument('--spacing',           type=float, default=4.0, help='Tree spacing for spawnTreesAndSavePointcloud.')
     p.add_argument('--action_stats_path', type=str, default='/root/workspace/YOPO/run/poly-action-rw/ckpt/super/action_stats_super.pt')
     p.add_argument('--coeff_stats_path',  type=str, default='/root/workspace/YOPO/run/poly-action-rw/ckpt/super/coeff_stats_super.pt')
     p.add_argument('--num_steps',         type=int, default=5)
@@ -602,6 +604,7 @@ def main():
     from flowpilot.scheduler import FlowMatchScheduler
     from flowpilot.models.flowpilot import FlowPilotPhase2
     from flowpilot.models.vae_encoder import WanVAEEncoder
+    from flowpilot.models.depth_encoder import DepthEncoder
     from flowpilot.models.poly_action import BernsteinActionBasis
     from flowpilot.coords import body_to_world, get_body_frame
 
@@ -630,7 +633,7 @@ def main():
     wb = env.world_box.astype(np.float64)
     print(f'[env] scene {args.scene_id} ready, world_box={wb.tolist()}')
 
-    env.spawnTreesAndSavePointcloud(args.scene_id, spacing=4.0)
+    env.spawnTreesAndSavePointcloud(args.scene_id, spacing=args.spacing)
     env.render()
 
     # --- Publish scene point cloud (latched, published once) ---
@@ -662,8 +665,14 @@ def main():
         model = torch.compile(model, mode='reduce-overhead')
         print('[model] compiled with torch.compile(mode=reduce-overhead)')
 
-    vae_encoder = WanVAEEncoder(ckpt(args.vae_pth), dtype=torch.bfloat16, device=args.device)
-    vae_encoder.eval()
+    if args.depth_encoder_ckpt:
+        vae_encoder = DepthEncoder(z_dim=48).to(args.device).eval()
+        _de_ckpt = torch.load(args.depth_encoder_ckpt, map_location=args.device, weights_only=True)
+        vae_encoder.load_state_dict(_de_ckpt["model"])
+        print(f'[vae] depth_encoder loaded ({args.depth_encoder_ckpt})')
+    else:
+        vae_encoder = WanVAEEncoder(ckpt(args.vae_pth), dtype=torch.bfloat16, device=args.device)
+        vae_encoder.eval()
 
     basis     = BernsteinActionBasis(degree=7, T=1.6, num_waypoints=48, hz=30, device=args.device)
     scheduler = FlowMatchScheduler(num_train_timesteps=1000, shift=5.0)
@@ -725,6 +734,7 @@ def main():
         env.setState(cur.pos, cur.vel, cur.acc, quat_render)
         env.render()
         cond_depth = env.getDepthImage()[0][0].astype(np.float32)
+        publish_depth(depth_pub, cond_depth)
 
         print(f'[run] start=({cur.pos[0]:.1f},{cur.pos[1]:.1f},{cur.pos[2]:.1f}) '
               f'goal=({goal_pos[0]:.1f},{goal_pos[1]:.1f},{goal_pos[2]:.1f})')
@@ -809,10 +819,9 @@ def main():
             dist = float(np.linalg.norm(goal_pos - cur.pos))
             if dist < args.goal_reach_dist:
                 print(f'[run] arrived! dist={dist:.2f}m. Enter hover mode (waiting new goal).')
-                hover_dt = 1.0 / max(1e-3, float(args.hover_rate_hz))
+                hover_dt  = 1.0 / max(1e-3, float(args.hover_rate_hz))
                 hover_vel = np.zeros(3, dtype=np.float64)
                 hover_acc = np.zeros(3, dtype=np.float64)
-                hover_jerk = np.zeros(3, dtype=np.float64)
 
                 while not rospy.is_shutdown():
                     with _goal_lock:
@@ -822,13 +831,13 @@ def main():
                             print(f'[run] leave hover, new goal=({goal_pos[0]:.1f},{goal_pos[1]:.1f})')
                             break
 
-                    # Hold at last feasible state instead of cutting execution.
                     env.setState(cur.pos, hover_vel, hover_acc, last_quat_render)
                     env.render()
                     cond_depth = env.getDepthImage()[0][0].astype(np.float32)
 
                     publish_depth(depth_pub, cond_depth)
                     publish_drone_marker(marker_pub, cur.pos, last_quat_render)
+                    publish_vel_marker(vel_pub, cur.pos, hover_vel)
                     publish_goal_marker(goal_pub, goal_pos)
                     broadcast_tf(tf_br, cur.pos, last_quat_render)
                     local_msg = depth_to_local_cloud_msg(cond_depth, cur.pos, last_quat_render)
@@ -836,7 +845,7 @@ def main():
                         local_cloud_pub.publish(local_msg)
 
                     cur = WorldState(pos=cur.pos.copy(), vel=hover_vel.copy(),
-                                     acc=hover_acc.copy(), jerk=hover_jerk.copy())
+                                     acc=hover_acc.copy(), jerk=np.zeros(3))
                     time.sleep(hover_dt)
                 break
 
