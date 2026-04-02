@@ -143,10 +143,12 @@ class YOPOContainer:
             f"--env=DISPLAY={display}",
             f"--env=NVIDIA_VISIBLE_DEVICES=all",
             f"--env=NVIDIA_DRIVER_CAPABILITIES=all",
+            f"--env=__NV_PRIME_RENDER_OFFLOAD=1",
+            f"--env=__GLX_VENDOR_LIBRARY_NAME=nvidia",
+            f"--env=__VK_LAYER_NV_optimus=NVIDIA_only",
             f"--env=TZ=Asia/Shanghai",
             f"--env=FLIGHTMARE_PATH={self.CONTAINER_WORKSPACE}/YOPO",
             f"--env=PYTHONPATH={self.CONTAINER_WORKSPACE}/YOPO:{self.CONTAINER_WORKSPACE}/YOPO/flightlib/build",
-            "--privileged",
             "--network=host",
             self.image_full,
         ]

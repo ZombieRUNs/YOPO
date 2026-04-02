@@ -7,3 +7,6 @@ docker/
 __pycache__/
 run/yopo_sim/
 run/saved/
+run/dataset/
+run/poly-action-rw/ckpt/
+run/poly-action-rw/.git/

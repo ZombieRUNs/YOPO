@@ -28,10 +28,14 @@ Output layout:
 """
 
 import argparse
+import atexit
 import json
 import math
+import signal
 import os
 import shutil
+import subprocess
+import time
 import sys
 import tempfile
 
@@ -51,9 +55,9 @@ SAVE_ROOT = "dataset/gcopter_trajs"
 DEFAULT_IMG_WIDTH = 160
 DEFAULT_IMG_HEIGHT = 96
 DEFAULT_RGB_FPS = 30.0
-DEFAULT_VMAX_MIN = 7.0
+DEFAULT_VMAX_MIN = 4.0
 DEFAULT_VMAX_MAX = 7.0
-DEFAULT_CAMERA_PITCH_DEG = 0.0
+DEFAULT_CAMERA_PITCH_DEG = -10.0
 
 MAP_BOUND = [-25.0, 25.0, -25.0, 25.0, 0.0, 5.0]  # [xmin,xmax,ymin,ymax,zmin,zmax]
 VOXEL_WIDTH = 0.25   # metres
@@ -223,6 +227,100 @@ def make_planner_with_vmax(gcopter_planner_mod, planner_cfg_path: str, v_max: fl
     return planner
 
 
+def build_flightmare_env():
+    """Prefer NVIDIA PRIME offload on hybrid-graphics Linux setups."""
+    env = os.environ.copy()
+    if env.get("DISPLAY"):
+        env.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
+        env.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+        env.setdefault("__VK_LAYER_NV_optimus", "NVIDIA_only")
+    return env
+
+
+def cleanup_stale_flightmare(binary_name: str = "flightmare.x86_64"):
+    """Kill stale Flightmare processes to avoid ZMQ/PLY conflicts across reruns."""
+    result = subprocess.run(
+        ["pgrep", "-f", binary_name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    pids = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid = int(line)
+        except ValueError:
+            continue
+        if pid != os.getpid():
+            pids.append(pid)
+
+    if not pids:
+        return
+
+    print(f"[INFO] terminating stale Flightmare processes: {pids}", flush=True)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        alive = []
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                alive.append(pid)
+            except ProcessLookupError:
+                pass
+        if not alive:
+            return
+        time.sleep(0.2)
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def launch_flightmare(binary_path: str):
+    """Launch Flightmare in the background with NVIDIA offload hints when available."""
+    cleanup_stale_flightmare(os.path.basename(binary_path))
+    env = build_flightmare_env()
+    launch_env = {
+        "DISPLAY": env.get("DISPLAY", ""),
+        "__NV_PRIME_RENDER_OFFLOAD": env.get("__NV_PRIME_RENDER_OFFLOAD", ""),
+        "__GLX_VENDOR_LIBRARY_NAME": env.get("__GLX_VENDOR_LIBRARY_NAME", ""),
+        "__VK_LAYER_NV_optimus": env.get("__VK_LAYER_NV_optimus", ""),
+    }
+    print(f"[INFO] launching Flightmare with env={launch_env}", flush=True)
+    proc = subprocess.Popen(
+        [binary_path],
+        cwd=os.path.dirname(binary_path),
+        env=env,
+        start_new_session=True,
+    )
+
+    def _cleanup_proc():
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    atexit.register(_cleanup_proc)
+    return proc
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -251,7 +349,7 @@ def main(args):
     cfg["env"]["render"] = True
     cfg["env"]["supervised"] = False
     cfg["env"]["imitation"] = False
-    os.system(FLIGHTMARE_PATH + "/flightrender/RPG_Flightmare/flightmare.x86_64 &")
+    launch_flightmare(os.path.join(FLIGHTMARE_PATH, "flightrender", "RPG_Flightmare", "flightmare.x86_64"))
     env = wrapper.FlightEnvVec(QuadrotorEnv_v1(dump(cfg, Dumper=RoundTripDumper), False))
     env.connectUnity()
 
