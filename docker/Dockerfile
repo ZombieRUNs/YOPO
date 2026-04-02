@@ -83,7 +83,7 @@ RUN pip install --no-cache-dir "pip==23.3.2" "setuptools==65.5.0" "wheel==0.38.4
     "ruamel.yaml==0.17.21" \
     "numpy==1.22.3" \
     "tensorboard==2.8.0" \
-    empy \
+    "empy==3.3.4" \
     catkin_pkg \
     tqdm
 
@@ -208,7 +208,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bc \
     dmidecode \
     geographiclib-tools \
-    geographiclib-datasets \
     gazebo11 \
     gazebo11-common \
     gazebo11-plugin-base \

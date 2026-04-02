@@ -149,7 +149,6 @@ class YOPOContainer:
             f"--env=TZ=Asia/Shanghai",
             f"--env=FLIGHTMARE_PATH={self.CONTAINER_WORKSPACE}/YOPO",
             f"--env=PYTHONPATH={self.CONTAINER_WORKSPACE}/YOPO:{self.CONTAINER_WORKSPACE}/YOPO/flightlib/build",
-            "--privileged",
             "--network=host",
             self.image_full,
         ]
