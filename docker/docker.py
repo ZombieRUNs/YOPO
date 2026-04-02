@@ -30,7 +30,7 @@ class YOPOContainer:
     """Manage Docker containers for the YOPO project."""
 
     IMAGE_NAME = "yopo"
-    IMAGE_TAG = "cu118"
+    IMAGE_TAG = "cu128"
     CONTAINER_WORKSPACE = "/root/workspace"
 
     def __init__(self, project_dir: Path, mount_dir: Path):

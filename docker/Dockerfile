@@ -1,8 +1,8 @@
 # ============================================================
 # YOPO: You Only Plan Once — build environment
-# Base: CUDA 11.8 + Ubuntu 20.04 + ROS Noetic
+# Base: CUDA 12.8 + Ubuntu 20.04 + ROS Noetic
 # ============================================================
-FROM nvidia/cuda:11.8.0-devel-ubuntu20.04
+FROM nvidia/cuda:12.8.0-devel-ubuntu20.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
