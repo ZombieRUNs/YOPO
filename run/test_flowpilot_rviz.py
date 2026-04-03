@@ -124,10 +124,50 @@ def cleanup_stale_flightmare(binary_name: str = "flightmare.x86_64"):
             pass
 
 
+_STUB_DLOPEN_SRC = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <string.h>
+void *dlopen(const char *f, int flags) {
+    static void *(*real)(const char*,int)=NULL;
+    if(!real)real=dlsym(RTLD_NEXT,"dlopen");
+    if(f&&strstr(f,"libasound"))return NULL;
+    return real(f,flags);
+}
+"""
+
+def _build_alsa_stub() -> str:
+    """Compile a dlopen-intercepting stub to suppress FMOD ALSA crashes in Docker."""
+    import tempfile
+    so_path = "/tmp/stub_dlopen_flightmare.so"
+    src_path = "/tmp/stub_dlopen_flightmare.c"
+    if not os.path.exists(so_path):
+        with open(src_path, "w") as f:
+            f.write(_STUB_DLOPEN_SRC)
+        ret = subprocess.run(
+            ["gcc", "-shared", "-fPIC", "-o", so_path, src_path, "-ldl"],
+            capture_output=True, text=True,
+        )
+        if ret.returncode != 0:
+            print(f"[WARN] Failed to compile ALSA stub: {ret.stderr}", flush=True)
+            return ""
+        print("[INFO] Compiled ALSA dlopen stub.", flush=True)
+    return so_path
+
+
 def launch_flightmare(binary_path: str):
     """Launch Flightmare in the background with NVIDIA offload hints when available."""
     cleanup_stale_flightmare(os.path.basename(binary_path))
     env = build_flightmare_env()
+
+    # In Docker containers libasound is present but has no audio devices, causing
+    # FMOD to segfault during ALSA enumeration. Intercept dlopen so FMOD cannot
+    # load libasound at all (same effect as the library being absent).
+    stub = _build_alsa_stub()
+    if stub:
+        preload = env.get("LD_PRELOAD", "")
+        env["LD_PRELOAD"] = f"{stub}:{preload}" if preload else stub
+
     launch_env = {
         "DISPLAY": env.get("DISPLAY", ""),
         "__NV_PRIME_RENDER_OFFLOAD": env.get("__NV_PRIME_RENDER_OFFLOAD", ""),
