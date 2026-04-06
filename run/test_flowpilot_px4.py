@@ -800,6 +800,8 @@ def main():
     traj_id  = 0
     in_hover = False
     step_deadline = time.perf_counter()
+    _prev_coefs  = None   # [8,3] descending power basis of last published trajectory
+    _prev_t_snap = None   # rospy.Time of last snapshot
 
     while not rospy.is_shutdown():
 
@@ -818,12 +820,15 @@ def main():
             goal_seq = new_seq
             wp_world = None
             in_hover = False
+            _prev_coefs  = None   # reset on new goal so first traj starts from cur_pos
+            _prev_t_snap = None
             print(f'[run] goal=({goal_pos[0]:.1f},{goal_pos[1]:.1f},{goal_pos[2]:.1f})')
 
         if goal_pos is not None:
             publish_goal_marker(goal_pub, goal_pos)
 
         # ---- Snapshot latest odom + depth -----------------------------------
+        t_snap = rospy.Time.now()           # record before inference starts
         with _odom_lock:
             cur_pos  = _odom_pos.copy()
             cur_vel  = _odom_vel.copy()
@@ -856,15 +861,49 @@ def main():
             infer_ms = (time.perf_counter() - t0) * 1000.0
 
             if np.all(np.isfinite(wp_body)) and np.all(np.isfinite(ctrl_pts_body)):
-                wp_new = body_to_world(wp_body, cur_pos, r_wb).astype(np.float64)
+                # Reference-continuous origin: start new trajectory from the old
+                # trajectory's reference position at the snapshot time, not from
+                # the drone's actual position.  This prevents the MPC from seeing
+                # a sudden reference position jump (0.1–0.3 m) at each replanning
+                # event, which was causing abrupt pitch changes.
+                if _prev_coefs is not None and _prev_t_snap is not None:
+                    t_old_at_snap = (t_snap - _prev_t_snap).to_sec()
+                    if 0.0 <= t_old_at_snap <= basis.T:
+                        traj_origin = np.array(
+                            sum(_prev_coefs[7-k] * (t_old_at_snap**k) for k in range(8)),
+                            dtype=np.float64)
+                    else:
+                        traj_origin = cur_pos   # old traj expired, fall back
+                else:
+                    traj_origin = cur_pos       # first trajectory: use actual position
+
+                wp_new = body_to_world(wp_body, traj_origin, r_wb).astype(np.float64)
                 wp_world = wp_new
                 publish_trajectory(traj_pub, wp_world)
 
-                ctrl_pts_world = (r_wb @ ctrl_pts_body.T).T + cur_pos
+                ctrl_pts_world = (r_wb @ ctrl_pts_body.T).T + traj_origin
                 coefs_world = _bernstein_to_power_descending(ctrl_pts_world, basis.T)
+
+                pos_shift = float(np.linalg.norm(traj_origin - cur_pos))
+
+                # pos_jump: reference discontinuity the MPC actually sees at switch
+                t_new = infer_ms / 1000.0
+                if _prev_coefs is not None and _prev_t_snap is not None:
+                    t_old = (t_snap - _prev_t_snap).to_sec() + t_new
+                    new_ref = sum(coefs_world[7-k] * (t_new**k) for k in range(8))
+                    old_ref = sum(_prev_coefs[7-k] * (t_old**k) for k in range(8))
+                    pos_jump = float(np.linalg.norm(
+                        np.array(new_ref) - np.array(old_ref)))
+                    print(f'[switch] origin_shift={pos_shift:.3f}m  pos_jump={pos_jump:.3f}m')
+                else:
+                    print(f'[switch] origin_shift={pos_shift:.3f}m  pos_jump=n/a(first)')
+
+                _prev_coefs  = coefs_world.copy()
+                _prev_t_snap = t_snap
+
                 traj_id += 1
                 publish_poly_traj(poly_traj_pub, coefs_world, basis.T,
-                                  traj_id, rospy.Time.now())
+                                  traj_id, t_snap)
             else:
                 print('[run] NaN/Inf in output, keeping previous trajectory.')
 
