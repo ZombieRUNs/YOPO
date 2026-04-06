@@ -77,7 +77,15 @@ _odom_vel:  Optional[np.ndarray] = None   # [3]    world-frame velocity
 # Converted from ROS {x,y,z,w} to FlowPilot [w,x,y,z] in the callback.
 _odom_quat: Optional[np.ndarray] = None
 
-_flightmare_proc = None
+_depth_lock = threading.Lock()
+_depth_img: Optional[np.ndarray] = None   # [96, 160] float32, [0,1]
+
+
+def _callback_depth(msg: Image) -> None:
+    global _depth_img
+    arr = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
+    with _depth_lock:
+        _depth_img = arr.copy()
 
 
 def _callback_set_goal(msg: PoseStamped) -> None:
@@ -656,7 +664,7 @@ def publish_poly_traj(pub, coefs_world: np.ndarray, T: float,
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description='FlowPilot PX4-integrated test (odometry-driven rendering).')
+        description='FlowPilot inference node: subscribes to depth + odom, publishes PolyTraj.')
     p.add_argument('--flowpilot_root',     type=str,
                    default='/root/workspace/YOPO/run/poly-action-rw')
     p.add_argument('--device',             type=str, default='cuda')
@@ -671,20 +679,16 @@ def parse_args():
     p.add_argument('--coeff_stats_path',   type=str,
                    default='/root/workspace/YOPO/run/poly-action-rw/ckpt/super/coeff_stats_super.pt')
     p.add_argument('--odom_topic',         type=str,
-                   default='/some_object_name_vrpn_client/estimated_odometry',
-                   help='nav_msgs/Odometry topic from PX4/VRPN ground-truth.')
-    p.add_argument('--scene_id',           type=int, default=0)
-    p.add_argument('--spacing',            type=float, default=4.0)
+                   default='/some_object_name_vrpn_client/estimated_odometry')
+    p.add_argument('--depth_topic',        type=str, default='/flowpilot/depth',
+                   help='Depth image topic published by flightmare_renderer.py.')
     p.add_argument('--num_steps',          type=int, default=5)
-    p.add_argument('--infer_every_n',      type=int, default=24,
-                   help='Re-run inference every N render frames (30 Hz → default 0.8 s).')
-    p.add_argument('--v_cmd',             type=float, default=6.0)
-    p.add_argument('--goal_reach_dist',   type=float, default=2.0)
-    p.add_argument('--camera_pitch_deg',  type=float, default=-15.0)
-    p.add_argument('--render_hz',         type=float, default=30.0)
-    p.add_argument('--launch_unity',      action='store_true')
-    p.add_argument('--compile_model',     action='store_true')
-    p.add_argument('--num_layers',        type=int, default=12)
+    p.add_argument('--infer_hz',           type=float, default=1.25,
+                   help='Inference rate in Hz (default 1.25 = every 0.8 s).')
+    p.add_argument('--v_cmd',              type=float, default=6.0)
+    p.add_argument('--goal_reach_dist',    type=float, default=2.0)
+    p.add_argument('--compile_model',      action='store_true')
+    p.add_argument('--num_layers',         type=int, default=12)
     return p.parse_args()
 
 
@@ -694,7 +698,6 @@ def parse_args():
 
 def main():
     faulthandler.enable(all_threads=True)
-    global _flightmare_proc
 
     args       = parse_args()
     script_dir = Path(__file__).resolve().parent
@@ -703,22 +706,19 @@ def main():
         return path if os.path.isabs(path) else str(script_dir / path)
 
     # --- ROS init ---
-    rospy.init_node('flowpilot_px4', anonymous=False)
-    traj_pub        = rospy.Publisher('/flowpilot/best_traj_visual', PointCloud2, queue_size=1)
-    map_pub         = rospy.Publisher('/local_map',                  PointCloud2, queue_size=1, latch=True)
-    local_cloud_pub = rospy.Publisher('/flowpilot/local_cloud',      PointCloud2, queue_size=1)
-    depth_pub       = rospy.Publisher('/depth_image',                Image,       queue_size=1)
-    marker_pub      = rospy.Publisher('/uav_mesh',                   Marker,      queue_size=1)
-    vel_pub         = rospy.Publisher('/flowpilot/vel_marker',       Marker,      queue_size=1)
-    goal_pub        = rospy.Publisher('/flowpilot/goal_marker',      Marker,      queue_size=1)
-    tf_br           = tf2_ros.TransformBroadcaster()
+    rospy.init_node('flowpilot_infer', anonymous=False)
+    traj_pub  = rospy.Publisher('/flowpilot/best_traj_visual', PointCloud2, queue_size=1)
+    goal_pub  = rospy.Publisher('/flowpilot/goal_marker',      Marker,      queue_size=1)
 
     rospy.Subscriber('/move_base_simple/goal', PoseStamped, _callback_set_goal, queue_size=1)
-    rospy.Subscriber(args.odom_topic, Odometry, _callback_odom, queue_size=1)
+    rospy.Subscriber(args.odom_topic,  Odometry, _callback_odom,  queue_size=1)
+    rospy.Subscriber(args.depth_topic, Image,    _callback_depth,  queue_size=1)
 
     ros_thread = threading.Thread(target=rospy.spin, daemon=True)
     ros_thread.start()
-    print(f'[ROS] node started.  Odometry: {args.odom_topic}')
+    print(f'[ROS] inference node started.')
+    print(f'      odom:  {args.odom_topic}')
+    print(f'      depth: {args.depth_topic}')
 
     # --- FlowPilot imports ---
     flowpilot_root = ckpt(args.flowpilot_root)
@@ -731,51 +731,9 @@ def main():
     from flowpilot.models.poly_action import BernsteinActionBasis
     from flowpilot.coords import body_to_world, get_body_frame
 
-    # traj_utils requires the catkin devel workspace to be sourced
     from traj_utils.msg import PolyTraj
     poly_traj_pub = rospy.Publisher('/drone_0_planning/trajectory',
                                     PolyTraj, queue_size=1)
-
-    # --- Flightmare env ---
-    flightmare_path = os.environ.get('FLIGHTMARE_PATH', str(script_dir.parent))
-    os.environ.setdefault('FLIGHTMARE_PATH', flightmare_path)
-    from flightgym import QuadrotorEnv_v1
-    from flightpolicy.envs import vec_env_wrapper as wrapper
-
-    if args.launch_unity:
-        binary_path = os.path.join(
-            flightmare_path, 'flightrender/RPG_Flightmare/flightmare.x86_64')
-        _flightmare_proc = launch_flightmare(binary_path)
-        atexit.register(terminate_process, _flightmare_proc)
-
-    cfg_path = os.path.join(flightmare_path, 'flightlib', 'configs', 'vec_env.yaml')
-    cfg = YAML().load(open(cfg_path))
-    cfg['env']['num_envs']   = 1
-    cfg['env']['num_threads'] = 1
-    cfg['env']['render']     = True
-    cfg['env']['supervised'] = False
-    cfg['env']['imitation']  = False
-    env = wrapper.FlightEnvVec(QuadrotorEnv_v1(dump(cfg, Dumper=RoundTripDumper), False))
-    env.connectUnity()
-    env.setMapID(np.array([args.scene_id]))
-    wb = env.world_box.astype(np.float64)
-    print(f'[env] scene {args.scene_id} ready, world_box={wb.tolist()}')
-
-    env.spawnTreesAndSavePointcloud(args.scene_id, spacing=args.spacing)
-    env.reset()
-    env.render()
-
-    # Publish scene point cloud (latched)
-    ply_path = os.path.join(flightmare_path, 'run', 'yopo_sim',
-                            f'pointcloud-{args.scene_id}.ply')
-    if os.path.exists(ply_path):
-        try:
-            pts = _voxel_downsample(_load_ply_xyz(ply_path), voxel_size=0.3)
-            h = Header(); h.stamp = rospy.Time.now(); h.frame_id = 'world'
-            map_pub.publish(point_cloud2.create_cloud_xyz32(h, pts))
-            print(f'[map] published {len(pts)} pts from {ply_path}')
-        except Exception as e:
-            print(f'[map] failed: {e}')
 
     # --- Model ---
     model = FlowPilotPhase2(
@@ -788,13 +746,13 @@ def main():
     model.eval()
     if args.compile_model:
         model = torch.compile(model, mode='reduce-overhead')
-        print('[model] compiled with torch.compile(mode=reduce-overhead)')
+        print('[model] compiled.')
 
     if args.depth_encoder_ckpt:
         vae_encoder = DepthEncoder(z_dim=48).to(args.device).eval()
         _de_ckpt = torch.load(args.depth_encoder_ckpt, map_location=args.device, weights_only=True)
         vae_encoder.load_state_dict(_de_ckpt['model'])
-        print(f'[vae] depth_encoder loaded ({args.depth_encoder_ckpt})')
+        print(f'[vae] depth_encoder loaded.')
     else:
         vae_encoder = WanVAEEncoder(ckpt(args.vae_pth),
                                     dtype=torch.bfloat16, device=args.device)
@@ -804,53 +762,44 @@ def main():
                                      device=args.device)
     scheduler = FlowMatchScheduler(num_train_timesteps=1000, shift=5.0)
 
-    astats   = torch.load(ckpt(args.action_stats_path), map_location=args.device, weights_only=True)
-    cstats   = torch.load(ckpt(args.coeff_stats_path),  map_location=args.device, weights_only=True)
-    sg_mean  = astats['sg_mean'].to(args.device)
-    sg_std   = astats['sg_std'].to(args.device)
+    astats    = torch.load(ckpt(args.action_stats_path), map_location=args.device, weights_only=True)
+    cstats    = torch.load(ckpt(args.coeff_stats_path),  map_location=args.device, weights_only=True)
+    sg_mean   = astats['sg_mean'].to(args.device)
+    sg_std    = astats['sg_std'].to(args.device)
     free_mean = cstats['free_mean'].to(args.device)
     free_std  = cstats['free_std'].to(args.device)
     print('[model] weights loaded.')
 
     # Warm-up
     torch.set_grad_enabled(False)
-    _dummy_depth = np.zeros((96, 160), dtype=np.float32)
-    _dummy_sg    = np.zeros(25, dtype=np.float32)
     infer_one_step(model, vae_encoder, basis, scheduler,
-                   _dummy_depth, _dummy_sg, sg_mean, sg_std,
-                   free_mean, free_std, args.v_cmd, args.num_steps, args.device)
+                   np.zeros((96, 160), dtype=np.float32),
+                   np.zeros(25, dtype=np.float32),
+                   sg_mean, sg_std, free_mean, free_std,
+                   args.v_cmd, args.num_steps, args.device)
     print('[model] warm-up done.')
 
-    # Camera pitch quaternion (applied on top of body quat for rendering)
-    pitch_rad = float(args.camera_pitch_deg) * math.pi / 180.0
-    q_pitch   = np.array([math.cos(0.5*pitch_rad), 0.0,
-                           math.sin(0.5*pitch_rad), 0.0], dtype=np.float64)
+    infer_dt = 1.0 / max(1e-3, float(args.infer_hz))
 
-    render_dt = 1.0 / max(1e-3, float(args.render_hz))
-
-    # --- Wait for first odometry ---
-    print('[odom] waiting for first odometry message ...')
+    # --- Wait for first odom + depth ---
+    print('[init] waiting for odom and depth ...')
     while not rospy.is_shutdown():
         with _odom_lock:
-            if _odom_pos is not None:
-                break
+            odom_ok = _odom_pos is not None
+        with _depth_lock:
+            depth_ok = _depth_img is not None
+        if odom_ok and depth_ok:
+            break
         time.sleep(0.05)
-    print(f'[odom] received.  pos={_odom_pos.tolist()}')
-
-    # --- Single flat 30 Hz render + inference loop ---
-    # Every frame: snapshot odometry → render → publish.
-    # Every infer_every_n frames: re-run FlowPilot inference → update wp_world.
-    # There is no inner loop.  The drone moves under real PX4 dynamics; we just
-    # follow its odometry.
+    print('[init] ready.')
 
     print('[RViz] set goal with 2D Nav Goal.')
-    wp_world: Optional[np.ndarray] = None   # [N,12] last predicted traj, world frame
+    wp_world: Optional[np.ndarray] = None
     goal_pos: Optional[np.ndarray] = None
-    goal_seq    = -1
-    render_step = 0
-    traj_id     = 0   # monotonically increasing; OMMPC requires traj_id >= 1
-    step_deadline = time.perf_counter()
+    goal_seq = -1
+    traj_id  = 0
     in_hover = False
+    step_deadline = time.perf_counter()
 
     while not rospy.is_shutdown():
 
@@ -865,20 +814,24 @@ def main():
             continue
 
         if goal_pos is None or new_seq != goal_seq:
-            goal_pos    = new_goal
-            goal_seq    = new_seq
-            wp_world    = None
-            render_step = 0
-            in_hover    = False
+            goal_pos = new_goal
+            goal_seq = new_seq
+            wp_world = None
+            in_hover = False
             print(f'[run] goal=({goal_pos[0]:.1f},{goal_pos[1]:.1f},{goal_pos[2]:.1f})')
 
-        # ---- Snapshot latest odometry ---------------------------------------
+        if goal_pos is not None:
+            publish_goal_marker(goal_pub, goal_pos)
+
+        # ---- Snapshot latest odom + depth -----------------------------------
         with _odom_lock:
             cur_pos  = _odom_pos.copy()
             cur_vel  = _odom_vel.copy()
-            cur_quat = _odom_quat.copy()   # [w,x,y,z] R_wb
+            cur_quat = _odom_quat.copy()
+        with _depth_lock:
+            cond_depth = _depth_img.copy()
 
-        # ---- ref acc/jerk: nearest point on last predicted trajectory -------
+        # ---- ref acc/jerk from last predicted trajectory --------------------
         ref_acc  = np.zeros(3, dtype=np.float64)
         ref_jerk = np.zeros(3, dtype=np.float64)
         if wp_world is not None:
@@ -886,44 +839,14 @@ def main():
             ref_acc  = nearest[6:9].astype(np.float64)
             ref_jerk = nearest[9:12].astype(np.float64)
 
-        # ---- Render using flatness-derived orientation (consistent with training) ----
-        # Policy was trained with yaw = velocity direction (via get_body_frame).
-        # Use that same convention for rendering so depth images match training distribution.
-        # Position comes from odometry; orientation comes from differential flatness.
-        quat_flat, _ = get_body_frame(cur_vel, ref_acc, ref_jerk)
-        quat_render = _safe_quat(np.asarray(quat_flat, dtype=np.float64))
-        if abs(pitch_rad) > 1e-12:
-            quat_render = _safe_quat(quat_mul(quat_render, q_pitch))
-
-        env.setState(cur_pos, cur_vel, ref_acc, quat_render)
-        env.render()
-        cond_depth = env.getDepthImage()[0][0].astype(np.float32)
-
-        # ---- Publish every frame --------------------------------------------
-        publish_depth(depth_pub, cond_depth)
-        publish_drone_marker(marker_pub, cur_pos, quat_render)
-        publish_vel_marker(vel_pub, cur_pos, cur_vel)
-        broadcast_tf(tf_br, cur_pos, quat_render)
-        local_msg = depth_to_local_cloud_msg(cond_depth, cur_pos, quat_render)
-        if local_msg is not None:
-            local_cloud_pub.publish(local_msg)
-        if goal_pos is not None:
-            publish_goal_marker(goal_pub, goal_pos)
-
-        # ---- Periodic inference (every infer_every_n frames) ----------------
-        if not in_hover and render_step % args.infer_every_n == 0:
+        # ---- Inference ------------------------------------------------------
+        if not in_hover:
             cur_state = WorldState(pos=cur_pos, vel=cur_vel,
                                    acc=ref_acc, jerk=ref_jerk)
-
-            # First inference: yaw body frame toward goal
-            init_q, init_r = yaw_frame_from_start_to_goal(cur_pos, goal_pos)
-            if wp_world is None and init_q is not None:
-                state_goal, quat_wb, r_wb = build_state_goal(
-                    cur_state, goal_pos, get_body_frame,
-                    quat_wb_override=init_q, r_wb_override=init_r)
-            else:
-                state_goal, quat_wb, r_wb = build_state_goal(
-                    cur_state, goal_pos, get_body_frame)
+            odom_r = quat_to_rot(cur_quat)
+            state_goal, _, r_wb = build_state_goal(
+                cur_state, goal_pos, get_body_frame,
+                quat_wb_override=cur_quat, r_wb_override=odom_r)
 
             t0 = time.perf_counter()
             wp_body, ctrl_pts_body = infer_one_step(
@@ -933,44 +856,35 @@ def main():
             infer_ms = (time.perf_counter() - t0) * 1000.0
 
             if np.all(np.isfinite(wp_body)) and np.all(np.isfinite(ctrl_pts_body)):
-                # body frame → world frame (flatness-derived R_wb, consistent with training)
                 wp_new = body_to_world(wp_body, cur_pos, r_wb).astype(np.float64)
-                wp_new[:, 0] = np.clip(wp_new[:, 0], wb[0]+0.2, wb[3]-0.2)
-                wp_new[:, 1] = np.clip(wp_new[:, 1], wb[1]+0.2, wb[4]-0.2)
-                wp_new[:, 2] = np.clip(wp_new[:, 2], max(0.05, wb[2]+0.05), wb[5]-0.1)
                 wp_world = wp_new
                 publish_trajectory(traj_pub, wp_world)
 
-                # Bernstein control points: body → world, then → power basis → OMMPC
-                ctrl_pts_world = (r_wb @ ctrl_pts_body.T).T + cur_pos  # [8, 3]
+                ctrl_pts_world = (r_wb @ ctrl_pts_body.T).T + cur_pos
                 coefs_world = _bernstein_to_power_descending(ctrl_pts_world, basis.T)
                 traj_id += 1
                 publish_poly_traj(poly_traj_pub, coefs_world, basis.T,
                                   traj_id, rospy.Time.now())
             else:
-                print('[run] NaN/Inf in inference output, keeping previous trajectory.')
+                print('[run] NaN/Inf in output, keeping previous trajectory.')
 
             dist = float(np.linalg.norm(goal_pos - cur_pos))
-            print(f'[run] step={render_step}  infer={infer_ms:.1f}ms  '
-                  f'dist={dist:.2f}m  '
+            print(f'[run] infer={infer_ms:.1f}ms  dist={dist:.2f}m  '
                   f'pos=({cur_pos[0]:.1f},{cur_pos[1]:.1f},{cur_pos[2]:.1f})')
 
-        # ---- Goal-reached check → hover mode --------------------------------
+        # ---- Goal-reached check ---------------------------------------------
         if not in_hover:
             dist = float(np.linalg.norm(goal_pos - cur_pos))
             if dist < args.goal_reach_dist:
-                print(f'[run] arrived! dist={dist:.2f}m. Hovering — send new goal to continue.')
+                print(f'[run] arrived! dist={dist:.2f}m. Hovering.')
                 in_hover = True
 
-        render_step += 1
-
-        # ---- Real-time pacing at render_hz ----------------------------------
-        step_deadline += render_dt
+        # ---- Rate control at infer_hz ---------------------------------------
+        step_deadline += infer_dt
         sleep_t = step_deadline - time.perf_counter()
         if sleep_t > 0.0:
             time.sleep(sleep_t)
         else:
-            # fell behind (e.g. inference took too long); reset deadline
             step_deadline = time.perf_counter()
 
 
