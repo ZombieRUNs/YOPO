@@ -143,7 +143,8 @@ def save_rgb_video(rgbs: np.ndarray, out_path: str, fps: float) -> None:
     writer.release()
 
 
-def collect_images(env, flatmap, waypoints, img_width, img_height, camera_pitch_deg=0.0):
+def collect_images(env, flatmap, waypoints, img_width, img_height,
+                   camera_pitch_deg=0.0, yaw_bias=0.0):
     """
     Walk the trajectory and collect depth/RGB images at each waypoint.
 
@@ -151,6 +152,10 @@ def collect_images(env, flatmap, waypoints, img_width, img_height, camera_pitch_
         env:        Flightmare FlightEnvVec
         flatmap:    gcopter_planner.FlatnessMap (pre-initialised)
         waypoints:  ndarray [M, 13]
+        yaw_bias:   constant yaw offset (rad) added to flatness yaw for the
+                    entire trajectory.  Sampled once per trajectory when
+                    --yaw_rand_deg > 0, simulating the gap between the
+                    flatness-derived yaw and the real PX4 yaw controller.
 
     Returns:
         depths: ndarray [M, H, W] float16, normalised to [0, 1]
@@ -170,12 +175,12 @@ def collect_images(env, flatmap, waypoints, img_width, img_height, camera_pitch_
         acc = np.array([ax, ay, az])
         jer = np.array([jx, jy, jz])
 
-        # Yaw = direction of flight; identity quat when near-hover
+        # Yaw = direction of flight (+ per-trajectory bias); identity quat when near-hover
         speed = math.sqrt(vx*vx + vy*vy + vz*vz)
         if speed < 1e-3:
             quat = np.array([1.0, 0.0, 0.0, 0.0])
         else:
-            psi = math.atan2(vy, vx)
+            psi = math.atan2(vy, vx) + yaw_bias
             _thr, quat, _omg = flatmap.forward(vel, acc, jer, psi, 0.0)
             quat = np.array(quat)
 
@@ -287,17 +292,43 @@ def cleanup_stale_flightmare(binary_name: str = "flightmare.x86_64"):
             pass
 
 
+_STUB_DLOPEN_SRC = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <string.h>
+void *dlopen(const char *f, int flags) {
+    static void *(*real)(const char*,int)=NULL;
+    if(!real)real=dlsym(RTLD_NEXT,"dlopen");
+    if(f&&strstr(f,"libasound"))return NULL;
+    return real(f,flags);
+}
+"""
+
+
+def _build_alsa_stub() -> str:
+    so_path  = '/tmp/stub_dlopen_flightmare.so'
+    src_path = '/tmp/stub_dlopen_flightmare.c'
+    if not os.path.exists(so_path):
+        with open(src_path, 'w') as f:
+            f.write(_STUB_DLOPEN_SRC)
+        ret = subprocess.run(
+            ['gcc', '-shared', '-fPIC', '-o', so_path, src_path, '-ldl'],
+            capture_output=True, text=True)
+        if ret.returncode != 0:
+            print(f'[WARN] ALSA stub compile failed: {ret.stderr}', flush=True)
+            return ''
+        print('[INFO] compiled ALSA dlopen stub.', flush=True)
+    return so_path
+
+
 def launch_flightmare(binary_path: str):
-    """Launch Flightmare in the background with NVIDIA offload hints when available."""
+    """Launch Flightmare in the background with NVIDIA offload hints and ALSA stub."""
     cleanup_stale_flightmare(os.path.basename(binary_path))
-    env = build_flightmare_env()
-    launch_env = {
-        "DISPLAY": env.get("DISPLAY", ""),
-        "__NV_PRIME_RENDER_OFFLOAD": env.get("__NV_PRIME_RENDER_OFFLOAD", ""),
-        "__GLX_VENDOR_LIBRARY_NAME": env.get("__GLX_VENDOR_LIBRARY_NAME", ""),
-        "__VK_LAYER_NV_optimus": env.get("__VK_LAYER_NV_optimus", ""),
-    }
-    print(f"[INFO] launching Flightmare with env={launch_env}", flush=True)
+    env  = build_flightmare_env()
+    stub = _build_alsa_stub()
+    if stub:
+        preload = env.get('LD_PRELOAD', '')
+        env['LD_PRELOAD'] = f'{stub}:{preload}' if preload else stub
     proc = subprocess.Popen(
         [binary_path],
         cwd=os.path.dirname(binary_path),
@@ -435,11 +466,14 @@ def main(args):
 
             # Collect depth/RGB images along the trajectory
             waypoints = result["waypoints"].astype(np.float32)
+            yaw_bias = (np.random.uniform(-1, 1) * math.radians(args.yaw_rand_deg)
+                        if args.yaw_rand_deg > 0 else 0.0)
             depths, rgbs = collect_images(
                 env, flatmap, waypoints,
                 img_width=args.img_width,
                 img_height=args.img_height,
                 camera_pitch_deg=args.camera_pitch_deg,
+                yaw_bias=yaw_bias,
             )
 
             # Save
@@ -454,6 +488,7 @@ def main(args):
             np.save(os.path.join(tdir, "start_pva.npy"), np.stack([sp, sv, sa]))
             np.save(os.path.join(tdir, "goal_pva.npy"),  np.stack([gp, gv, ga]))
             np.save(os.path.join(tdir, "v_max.npy"),     np.float32(v_max))
+            np.save(os.path.join(tdir, "yaw_bias.npy"), np.float32(yaw_bias))
 
             with open(os.path.join(tdir, "meta.json"), "w") as f:
                 json.dump(
@@ -521,6 +556,11 @@ def parse_args():
     parser.add_argument("--v_max_min",       type=float, default=DEFAULT_VMAX_MIN)
     parser.add_argument("--v_max_max",       type=float, default=DEFAULT_VMAX_MAX)
     parser.add_argument("--camera_pitch_deg", type=float, default=DEFAULT_CAMERA_PITCH_DEG)
+    parser.add_argument("--yaw_rand_deg",     type=float, default=0.0,
+                        help="Per-trajectory yaw randomisation range (deg). "
+                             "Each trajectory gets one uniform sample in "
+                             "[-yaw_rand_deg, +yaw_rand_deg] added to the "
+                             "flatness yaw. 0 = disabled (default).")
 
     valid_keys = {a.dest for a in parser._actions}
     unknown = sorted([k for k in cfg.keys() if k not in valid_keys])

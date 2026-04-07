@@ -36,6 +36,8 @@ import argparse
 import json
 import math
 import os
+import atexit
+import signal
 import subprocess
 import sys
 import tempfile
@@ -272,6 +274,121 @@ def decode_poly_traj_msg(msg):
 
 
 # ---------------------------------------------------------------------------
+# Flightmare launch helpers (mirrored from test_flowpilot_px4.py)
+# ---------------------------------------------------------------------------
+
+def _build_flightmare_env():
+    env = os.environ.copy()
+    if env.get('DISPLAY'):
+        env.setdefault('__NV_PRIME_RENDER_OFFLOAD', '1')
+        env.setdefault('__GLX_VENDOR_LIBRARY_NAME', 'nvidia')
+        env.setdefault('__VK_LAYER_NV_optimus', 'NVIDIA_only')
+    return env
+
+
+def _cleanup_stale_flightmare(binary_name: str = 'flightmare.x86_64'):
+    result = subprocess.run(['pgrep', '-f', binary_name],
+                            capture_output=True, text=True, check=False)
+    pids = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid = int(line)
+        except ValueError:
+            continue
+        if pid != os.getpid():
+            pids.append(pid)
+    if not pids:
+        return
+    print(f'[INFO] terminating stale Flightmare: {pids}', flush=True)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        alive = [p for p in pids if _pid_alive(p)]
+        if not alive:
+            return
+        time.sleep(0.2)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+_STUB_DLOPEN_SRC = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <string.h>
+void *dlopen(const char *f, int flags) {
+    static void *(*real)(const char*,int)=NULL;
+    if(!real)real=dlsym(RTLD_NEXT,"dlopen");
+    if(f&&strstr(f,"libasound"))return NULL;
+    return real(f,flags);
+}
+"""
+
+
+def _build_alsa_stub() -> str:
+    so_path  = '/tmp/stub_dlopen_flightmare.so'
+    src_path = '/tmp/stub_dlopen_flightmare.c'
+    if not os.path.exists(so_path):
+        with open(src_path, 'w') as f:
+            f.write(_STUB_DLOPEN_SRC)
+        ret = subprocess.run(
+            ['gcc', '-shared', '-fPIC', '-o', so_path, src_path, '-ldl'],
+            capture_output=True, text=True)
+        if ret.returncode != 0:
+            print(f'[WARN] ALSA stub compile failed: {ret.stderr}', flush=True)
+            return ''
+        print('[INFO] compiled ALSA dlopen stub.', flush=True)
+    return so_path
+
+
+def launch_flightmare(binary_path: str):
+    """Launch Flightmare with NVIDIA offload hints and ALSA dlopen stub."""
+    _cleanup_stale_flightmare(os.path.basename(binary_path))
+    env  = _build_flightmare_env()
+    stub = _build_alsa_stub()
+    if stub:
+        preload = env.get('LD_PRELOAD', '')
+        env['LD_PRELOAD'] = f'{stub}:{preload}' if preload else stub
+    proc = subprocess.Popen(
+        [binary_path],
+        cwd=os.path.dirname(binary_path),
+        env=env,
+        start_new_session=True)
+
+    def _cleanup():
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+    atexit.register(_cleanup)
+    return proc
+
+
+# ---------------------------------------------------------------------------
 # Image helpers (mirrored from collect_gcopter_trajs.py)
 # ---------------------------------------------------------------------------
 
@@ -286,8 +403,15 @@ def _quat_mul(q1, q2):
 
 
 def collect_images(env, flatmap, waypoints, img_width, img_height,
-                   camera_pitch_deg=0.0):
-    """Walk trajectory and collect depth/RGB via Flightmare."""
+                   camera_pitch_deg=0.0, yaw_bias=0.0):
+    """Walk trajectory and collect depth/RGB via Flightmare.
+
+    Args:
+        yaw_bias: constant yaw offset (rad) added to flatness yaw for the
+                  entire trajectory.  Sampled once per trajectory when
+                  --yaw_rand_deg > 0, simulating the gap between the
+                  flatness-derived yaw and the real PX4 yaw controller.
+    """
     M = len(waypoints)
     depths = np.zeros((M, img_height, img_width), dtype=np.float16)
     rgbs   = np.zeros((M, img_height, img_width, 3), dtype=np.uint8)
@@ -305,7 +429,7 @@ def collect_images(env, flatmap, waypoints, img_width, img_height,
         if speed < 1e-3:
             quat = np.array([1.0, 0.0, 0.0, 0.0])
         else:
-            psi = math.atan2(vy, vx)
+            psi = math.atan2(vy, vx) + yaw_bias
             _thr, quat, _omg = flatmap.forward(vel, acc, jer, psi, 0.0)
             quat = np.array(quat)
 
@@ -545,7 +669,7 @@ def main(args):
     cfg["env"]["render"]      = True
     cfg["env"]["supervised"]  = False
     cfg["env"]["imitation"]   = False
-    os.system(FLIGHTMARE_BIN + " &")
+    launch_flightmare(FLIGHTMARE_BIN)
     env = wrapper.FlightEnvVec(QuadrotorEnv_v1(dump(cfg, Dumper=RoundTripDumper), False))
     env.connectUnity()
 
@@ -585,22 +709,15 @@ def main(args):
 
     try:
         for scene_id in range(args.num_scenes):
-            scene_src_dir = os.path.join(gcopter_root, f"scene_{scene_id:03d}")
-            legacy_ply_path = os.path.join(scene_src_dir, "pointcloud.ply")
-            if not os.path.exists(legacy_ply_path):
-                print(f"[SKIP] scene {scene_id}: {legacy_ply_path} not found", flush=True)
-                continue
-
-            # ---- Rebuild Flightmare scene and use its generated PLY as source of truth ----
+            # ---- Rebuild Flightmare scene and use its generated PLY ----
             print(f"[scene {scene_id:03d}] Loading Flightmare scene ...", flush=True)
             env.setMapID(np.array([scene_id]))
             env.spawnTreesAndSavePointcloud(scene_id, spacing=4.0)
-            runtime_ply_path = os.path.join(YOPO_SIM_DIR, f"pointcloud-{scene_id}.ply")
-            ply_path = runtime_ply_path if os.path.exists(runtime_ply_path) else legacy_ply_path
-            if ply_path == legacy_ply_path:
-                print(f"  [WARN] runtime pointcloud not found, fallback to legacy: {legacy_ply_path}", flush=True)
-            else:
-                print(f"  using runtime pointcloud: {runtime_ply_path}", flush=True)
+            ply_path = os.path.join(YOPO_SIM_DIR, f"pointcloud-{scene_id}.ply")
+            if not os.path.exists(ply_path):
+                print(f"[SKIP] scene {scene_id}: runtime pointcloud not found: {ply_path}", flush=True)
+                continue
+            print(f"  using runtime pointcloud: {ply_path}", flush=True)
 
             # ---- PLY → PCD (from same map used by Flightmare rendering) ----
             pcd_path = os.path.join(SUPER_FOREST_DIR, f"scene_{scene_id:03d}.pcd")
@@ -749,11 +866,14 @@ def main(args):
                 durations = np.zeros((0,), dtype=np.float64)
 
                 # Collect depth/RGB via Flightmare
+                yaw_bias = (np.random.uniform(-1, 1) * math.radians(args.yaw_rand_deg)
+                            if args.yaw_rand_deg > 0 else 0.0)
                 depths, rgbs = collect_images(
                     env, flatmap, waypoints,
                     img_width=args.img_width,
                     img_height=args.img_height,
                     camera_pitch_deg=args.camera_pitch_deg,
+                    yaw_bias=yaw_bias,
                 )
 
                 # Save
@@ -767,6 +887,7 @@ def main(args):
                 save_rgb_video(rgbs, os.path.join(tdir, "rgb.mp4"), args.rgb_fps)
                 np.save(os.path.join(tdir, "start_pva.npy"),   start_pva)
                 np.save(os.path.join(tdir, "goal_pos.npy"),    goal_pos)
+                np.save(os.path.join(tdir, "yaw_bias.npy"),   np.float32(yaw_bias))
 
                 with open(os.path.join(tdir, "meta.json"), "w") as f:
                     json.dump({
@@ -864,6 +985,11 @@ def parse_args():
                         help="Alias of --max_dist (for GCOPTER-style naming)")
     parser.add_argument("--rgb_fps",            type=float, default=30.0)
     parser.add_argument("--camera_pitch_deg",   type=float, default=0.0)
+    parser.add_argument("--yaw_rand_deg",       type=float, default=0.0,
+                        help="Per-trajectory yaw randomisation range (deg). "
+                             "Each trajectory gets one uniform sample in "
+                             "[-yaw_rand_deg, +yaw_rand_deg] added to the "
+                             "flatness yaw. 0 = disabled (default).")
     # SUPER-specific
     parser.add_argument("--startup_wait",  type=float, default=8.0,
                         help="Extra seconds after odom appears for ROG-Map PCD loading")

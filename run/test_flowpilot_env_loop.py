@@ -87,9 +87,10 @@ def import_flowpilot_modules(flowpilot_root: str):
     from flowpilot.scheduler import FlowMatchScheduler
     from flowpilot.models.flowpilot import FlowPilotPhase2
     from flowpilot.models.vae_encoder import WanVAEEncoder
+    from flowpilot.models.depth_encoder import DepthEncoder
     from flowpilot.models.poly_action import BernsteinActionBasis
     from flowpilot.coords import body_to_world, get_body_frame
-    return FlowMatchScheduler, FlowPilotPhase2, WanVAEEncoder, BernsteinActionBasis, body_to_world, get_body_frame
+    return FlowMatchScheduler, FlowPilotPhase2, WanVAEEncoder, DepthEncoder, BernsteinActionBasis, body_to_world, get_body_frame
 
 
 @torch.no_grad()
@@ -246,6 +247,8 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--phase2_ckpt", type=str, default="/root/workspace/YOPO/run/poly-action-rw/ckpt/ckpt_final.pt")
     parser.add_argument("--vae_pth", type=str, default="/root/workspace/YOPO/run/poly-action-rw/ckpt/Wan2.2_VAE.pth")
+    parser.add_argument("--depth_encoder_ckpt", type=str, default="", help="If set, use lightweight DepthEncoder instead of Wan2.2 VAE.")
+    parser.add_argument("--spacing", type=float, default=4.0, help="Tree spacing for spawnTreesAndSavePointcloud.")
     parser.add_argument("--action_stats_path", type=str, default="/root/workspace/YOPO/run/poly-action-rw/ckpt/action_stats.pt")
     parser.add_argument("--coeff_stats_path", type=str, default="/root/workspace/YOPO/run/poly-action-rw/ckpt/coeff_stats.pt")
     parser.add_argument("--num_loops", type=int, default=100)
@@ -318,7 +321,7 @@ def main():
     run_out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[dbg] run output dir: {run_out_dir}", flush=True)
 
-    FlowMatchScheduler, FlowPilotPhase2, WanVAEEncoder, BernsteinActionBasis, body_to_world_fn, get_body_frame_fn = (
+    FlowMatchScheduler, FlowPilotPhase2, WanVAEEncoder, DepthEncoder, BernsteinActionBasis, body_to_world_fn, get_body_frame_fn = (
         import_flowpilot_modules(args.flowpilot_root)
     )
     print("[dbg] imports ok", flush=True)
@@ -348,7 +351,7 @@ def main():
 
     if args.spawn_trees_before_reset:
         print("[dbg] spawning trees before first reset...", flush=True)
-        env.spawnTreesAndSavePointcloud(args.scene_id, spacing=4.0)
+        env.spawnTreesAndSavePointcloud(args.scene_id, spacing=args.spacing)
         env.render()
         print("[dbg] spawn trees done", flush=True)
 
@@ -382,9 +385,15 @@ def main():
     if args.debug_stop_after == "model":
         return
 
-    vae_encoder = WanVAEEncoder(args.vae_pth, dtype=torch.bfloat16, device=args.device)
-    vae_encoder.eval()
-    print("[dbg] vae ok", flush=True)
+    if args.depth_encoder_ckpt:
+        vae_encoder = DepthEncoder(z_dim=48).to(args.device).eval()
+        ckpt_de = torch.load(args.depth_encoder_ckpt, map_location=args.device, weights_only=True)
+        vae_encoder.load_state_dict(ckpt_de["model"])
+        print(f"[dbg] depth_encoder ok ({args.depth_encoder_ckpt})", flush=True)
+    else:
+        vae_encoder = WanVAEEncoder(args.vae_pth, dtype=torch.bfloat16, device=args.device)
+        vae_encoder.eval()
+        print("[dbg] vae ok", flush=True)
     if args.debug_stop_after == "vae":
         return
 

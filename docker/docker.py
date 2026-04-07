@@ -31,14 +31,17 @@ class YOPOContainer:
 
     IMAGE_NAME = "yopo"
     IMAGE_TAG = "cu118"
+    ACR_IMAGE = "crpi-jq3nu6qbricb9zcb.cn-beijing.personal.cr.aliyuncs.com/zxh_in_bitac/drones:flightmare_datacollector_v2"
     CONTAINER_WORKSPACE = "/root/workspace"
 
-    def __init__(self, project_dir: Path, mount_dir: Path):
+    def __init__(self, project_dir: Path, mount_dir: Path, use_acr: bool = False):
         self.project_dir = project_dir.resolve()
         self.mount_dir = mount_dir.resolve()
         self.docker_dir = self.project_dir / "docker"
         self.hostname = get_hostname()
-        self.container_name = f"yopo-{self.project_dir.name}"
+        self.use_acr = use_acr
+        suffix = "datacollector" if use_acr else "cu118"
+        self.container_name = f"yopo-{self.project_dir.name}-{suffix}"
 
         assert shutil.which("docker"), (
             "Docker is not installed! "
@@ -52,7 +55,7 @@ class YOPOContainer:
 
     @property
     def image_full(self) -> str:
-        return f"{self.IMAGE_NAME}:{self.IMAGE_TAG}"
+        return self.ACR_IMAGE if self.use_acr else f"{self.IMAGE_NAME}:{self.IMAGE_TAG}"
 
     # ------------------------------------------------------------------
     # Docker queries
@@ -68,11 +71,20 @@ class YOPOContainer:
         images = self._docker_output("images", "--format", "{{.Repository}}:{{.Tag}}")
         return self.image_full in images.splitlines()
 
+    def does_acr_image_exist(self) -> bool:
+        images = self._docker_output("images", "--format", "{{.Repository}}:{{.Tag}}")
+        return self.ACR_IMAGE in images.splitlines()
+
     def get_running_container(self) -> Optional[str]:
         names = self._docker_output("ps", "--format", "{{.Names}}")
+        base_name = f"yopo-{self.project_dir.name}"
         for name in names.splitlines():
-            if self.container_name in name:
-                return name.strip()
+            name = name.strip()
+            if name == self.container_name:
+                return name
+            # backwards-compat: container started before the suffix was added
+            if not self.use_acr and name == base_name:
+                return name
         return None
 
     def has_nvidia_runtime(self) -> bool:
@@ -88,6 +100,17 @@ class YOPOContainer:
     # ------------------------------------------------------------------
     # Commands
     # ------------------------------------------------------------------
+
+    def pull(self):
+        """Pull the Docker image from Aliyun ACR, keeping it under its original name."""
+        if self.does_acr_image_exist():
+            print(f"[INFO] Image '{self.ACR_IMAGE}' already exists locally.")
+            return
+        print(f"[INFO] Tip: login first with:\n"
+              f"  docker login crpi-jq3nu6qbricb9zcb.cn-beijing.personal.cr.aliyuncs.com")
+        print(f"[INFO] Pulling '{self.ACR_IMAGE}' ...")
+        subprocess.run(["docker", "pull", self.ACR_IMAGE], check=True)
+        print(f"[INFO] Done. Image available as '{self.ACR_IMAGE}'.")
 
     def build(self):
         """Build the Docker image from the Dockerfile."""
@@ -122,7 +145,8 @@ class YOPOContainer:
 
         if not self.does_image_exist():
             raise RuntimeError(
-                f"Image '{self.image_full}' not found. Run `python docker.py build` first."
+                f"Image '{self.image_full}' not found. "
+                f"Run `python docker.py pull` or `python docker.py build` first."
             )
 
         display = os.environ.get("DISPLAY", ":0")
@@ -164,6 +188,7 @@ class YOPOContainer:
         subprocess.run(cmd, check=True)
         print(f"[INFO] Container '{self.container_name}' started.")
 
+
     def enter(self):
         """Exec into the running container."""
         running = self.get_running_container()
@@ -203,10 +228,12 @@ class YOPOContainer:
     def status(self):
         """Print the status of image and container."""
         img = "EXISTS" if self.does_image_exist() else "NOT FOUND"
+        acr = "EXISTS" if self.does_acr_image_exist() else "NOT FOUND"
         running = self.get_running_container()
         ctr = running if running else "NOT RUNNING"
-        print(f"  Image:     {self.image_full}  [{img}]")
-        print(f"  Container: {self.container_name}  [{ctr}]")
+        print(f"  Image (local): {self.image_full}  [{img}]")
+        print(f"  Image (ACR):   {self.ACR_IMAGE}  [{acr}]")
+        print(f"  Container:     {self.container_name}  [{ctr}]")
 
 
 def main():
@@ -218,12 +245,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python docker.py build          # Build the image\n"
-            "  python docker.py start          # Start container (detached)\n"
-            "  python docker.py enter          # Exec bash into container\n"
-            "  python docker.py stop           # Stop the container\n"
-            "  python docker.py status         # Show image/container status\n"
-            "  python docker.py logs           # Tail container logs\n"
+            "  python docker.py pull              # Pull the ACR datacollector image\n"
+            "  python docker.py build             # Build yopo:cu118 from Dockerfile\n"
+            "  python docker.py start             # Start yopo:cu118 container\n"
+            "  python docker.py start --acr       # Start ACR datacollector container\n"
+            "  python docker.py enter             # Enter yopo:cu118 container\n"
+            "  python docker.py enter --acr       # Enter ACR datacollector container\n"
+            "  python docker.py stop              # Stop yopo:cu118 container\n"
+            "  python docker.py stop  --acr       # Stop ACR datacollector container\n"
+            "  python docker.py status            # Show status of both images/containers\n"
         ),
     )
     parser.add_argument(
@@ -232,18 +262,24 @@ def main():
         help=f"Host directory to mount into the container (default: {default_mount})",
     )
 
+    acr_parent = argparse.ArgumentParser(add_help=False)
+    acr_parent.add_argument("--acr", action="store_true", help="Use the ACR datacollector image/container.")
+
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("pull",   help="Pull the Docker image from Aliyun ACR.")
     subparsers.add_parser("build",  help="Build the Docker image from Dockerfile.")
-    subparsers.add_parser("start",  help="Start the container in detached mode.")
-    subparsers.add_parser("enter",  help="Exec into the running container.")
-    subparsers.add_parser("stop",   help="Stop the running container.")
-    subparsers.add_parser("status", help="Show image and container status.")
-    subparsers.add_parser("logs",   help="Tail the container logs.")
+    subparsers.add_parser("start",  help="Start the container in detached mode.", parents=[acr_parent])
+    subparsers.add_parser("enter",  help="Exec into the running container.",       parents=[acr_parent])
+    subparsers.add_parser("stop",   help="Stop the running container.",            parents=[acr_parent])
+    subparsers.add_parser("status", help="Show image and container status.",       parents=[acr_parent])
+    subparsers.add_parser("logs",   help="Tail the container logs.",               parents=[acr_parent])
 
     args = parser.parse_args()
-    ci = YOPOContainer(project_dir=project_dir, mount_dir=Path(args.mount_dir))
+    ci = YOPOContainer(project_dir=project_dir, mount_dir=Path(args.mount_dir),
+                       use_acr=getattr(args, "acr", False))
 
     dispatch = {
+        "pull":   ci.pull,
         "build":  ci.build,
         "start":  ci.start,
         "enter":  ci.enter,
