@@ -1,0 +1,21 @@
+<launch>
+
+  <arg name="config_path" default="$(find flightlib)/configs/quadrotor_ros_px4.yaml" />
+  <arg name="odom_topic" default="/mavros/local_position/odom" />
+  <arg name="main_loop_freq" default="30.0" />
+  <arg name="scene_id" default="0" />
+  <arg name="unity_render" default="true" />
+  <arg name="spawn_tree" default="false" />
+  <arg name="save_pointcloud" default="false" />
+
+  <node pkg="flightlib" type="flightros_node" name="flight_pilot" output="screen">
+    <param name="config_path" value="$(arg config_path)" />
+    <param name="odom_topic" value="$(arg odom_topic)" />
+    <param name="main_loop_freq" value="$(arg main_loop_freq)" />
+    <param name="scene_id" value="$(arg scene_id)" />
+    <param name="unity_render" value="$(arg unity_render)" />
+    <param name="spawn_tree" value="$(arg spawn_tree)" />
+    <param name="save_pointcloud" value="$(arg save_pointcloud)" />
+  </node>
+
+</launch>

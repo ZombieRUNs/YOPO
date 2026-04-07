@@ -7,9 +7,12 @@ FlightPilot::FlightPilot(const ros::NodeHandle& nh, const ros::NodeHandle& pnh)
 	// quad initialization
 	quad_ptr_ = std::make_shared<Quadrotor>();
 	// load parameters
-	std::string cfg_path = getenv("FLIGHTMARE_PATH") + std::string("/flightlib/configs/quadrotor_ros.yaml");
-	YAML::Node cfg_      = YAML::LoadFile(cfg_path);
+	std::string default_cfg_path = getenv("FLIGHTMARE_PATH") + std::string("/flightlib/configs/quadrotor_ros.yaml");
+	pnh_.param<std::string>("config_path", config_path_, default_cfg_path);
+	config_path_ = resolveConfigPath(config_path_);
+	YAML::Node cfg_      = YAML::LoadFile(config_path_);
 	loadParams(cfg_);
+	applyRosParamOverrides();
 	configCamera(cfg_);
 	quad_ptr_->setSize(quad_size_);
 
@@ -30,6 +33,14 @@ FlightPilot::FlightPilot(const ros::NodeHandle& nh, const ros::NodeHandle& pnh)
 	clear_tree_sub_ = nh_.subscribe("/clear_tree", 1, &FlightPilot::clearTreeCallback, this);
 	save_pc_sub_    = nh_.subscribe("/save_pc", 1, &FlightPilot::savePointcloudCallback, this);
 	timestamp       = ros::Time::now();
+	ROS_INFO_STREAM("[FlightRos] Effective config:"
+	                << " config_path=" << config_path_
+	                << ", odom_topic=" << odom_topic_
+	                << ", main_loop_freq=" << main_loop_freq_
+	                << ", scene_id=" << static_cast<int>(scene_id_)
+	                << ", unity_render=" << unity_render_
+	                << ", spawn_tree=" << spawn_tree_
+	                << ", save_pointcloud=" << save_pointcloud_);
 
 	// connect unity and setup unity
 	setUnity();
@@ -173,7 +184,7 @@ bool FlightPilot::connectUnity() {
 }
 
 void FlightPilot::disconnectUnity() {
-	if (unity_render_ && unity_bridge_ptr_ != nullptr)
+	if (!unity_render_ || unity_bridge_ptr_ == nullptr)
 		return;
 	unity_bridge_ptr_->disconnectUnity();
 	unity_ready_ = false;
@@ -208,6 +219,39 @@ bool FlightPilot::loadParams(const YAML::Node& cfg) {
 		std::cout << "Directory created: " << ply_path_ << std::endl;
 	}
 	return true;
+}
+
+void FlightPilot::applyRosParamOverrides() {
+	pnh_.param<std::string>("odom_topic", odom_topic_, odom_topic_);
+	pnh_.param("main_loop_freq", main_loop_freq_, main_loop_freq_);
+
+	int scene_id = static_cast<int>(scene_id_);
+	pnh_.param("scene_id", scene_id, scene_id);
+	scene_id_ = static_cast<SceneID>(scene_id);
+
+	pnh_.param("unity_render", unity_render_, unity_render_);
+	pnh_.param("spawn_tree", spawn_tree_, spawn_tree_);
+	pnh_.param("save_pointcloud", save_pointcloud_, save_pointcloud_);
+	pnh_.param<std::string>("ply_path", ply_path_, ply_path_);
+
+	if (!boost::filesystem::path(ply_path_).is_absolute()) {
+		ply_path_ = resolveConfigPath(ply_path_);
+	}
+	if (!boost::filesystem::exists(ply_path_)) {
+		boost::filesystem::create_directories(ply_path_);
+		std::cout << "Directory created: " << ply_path_ << std::endl;
+	}
+}
+
+std::string FlightPilot::resolveConfigPath(const std::string& cfg_path) const {
+	if (cfg_path.empty() || boost::filesystem::path(cfg_path).is_absolute()) {
+		return cfg_path;
+	}
+	const char* flightmare_path = getenv("FLIGHTMARE_PATH");
+	if (flightmare_path == nullptr) {
+		return cfg_path;
+	}
+	return (boost::filesystem::path(flightmare_path) / cfg_path).string();
 }
 
 void FlightPilot::computeDepthImage(const cv::Mat& left_frame, const cv::Mat& right_frame, cv::Mat* const depth) {
