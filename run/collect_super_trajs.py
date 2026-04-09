@@ -71,6 +71,7 @@ SUPER_DATASET_ROOT   = "dataset/super_trajs"
 DT       = 1.0 / 30.0
 MIN_DIST = 30.0
 MAX_DIST = 40.0
+YAW_CHECK_WINDOW = 15   # frames (~0.5 s at 30 Hz) for velocity direction check
 
 DEFAULT_INIT_POS = [-10.0, 20.0, 2.5]   # fallback when env.reset() finds nothing
 
@@ -121,7 +122,8 @@ def load_super_runtime_params():
 def update_super_scene(scene_id: int, init_pos, pcd_dir: str, super_robot_r=None, super_max_vel=None,
                        super_planning_horizon=None, super_receding_dis=None,
                        super_corridor_line_max_length=None,
-                       super_safe_corridor_line_max_length=None, super_corridor_bound_dis=None) -> None:
+                       super_safe_corridor_line_max_length=None, super_corridor_bound_dis=None,
+                       super_inflation_step=None) -> None:
     """Update symlink + both YAML configs for a new scene."""
     pcd_src = os.path.join(pcd_dir, f"scene_{scene_id:03d}.pcd")
 
@@ -156,6 +158,8 @@ def update_super_scene(scene_id: int, init_pos, pcd_dir: str, super_robot_r=None
         cfg2["super_planner"]["safe_corridor_line_max_length"] = float(super_safe_corridor_line_max_length)
     if super_corridor_bound_dis is not None:
         cfg2["super_planner"]["corridor_bound_dis"] = float(super_corridor_bound_dis)
+    if super_inflation_step is not None:
+        cfg2["rog_map"]["inflation_step"] = int(super_inflation_step)
     _yaml_dump_rw(cfg2, SUPER_PLANNER_CFG)
 
 
@@ -677,10 +681,11 @@ def main(args):
     planner_cfg = os.path.join(FLIGHTLIB_CFG, "gcopter_config.yaml")
     planner     = gcopter_planner.GcopterPlanner(planner_cfg)
 
-    flat_cfg = planner.getConfig()
-    pp       = flat_cfg["physical_params"]
+    # Use PX4 Gazebo iris dynamics for flatness (camera pose during rendering).
+    # iris.sdf: mass=1.5, no body drag, rotor H-force drag only.
+    # Effective DH ≈ 4 * hover_omega(~794) * rotorDragCoeff(0.000175) ≈ 0.556
     flatmap  = gcopter_planner.FlatnessMap()
-    flatmap.reset(pp[0], pp[1], pp[2], pp[3], pp[4], pp[5])
+    flatmap.reset(1.5, 9.81, 0.556, 0.556, 0.0, 1e-4)  # mass, grav, dh, dv, cp, veps
 
     # ------------------------------------------------------------------ #
     #  roscore + rospy node (initialised once)                            #
@@ -746,7 +751,8 @@ def main(args):
                                super_receding_dis=args.super_receding_dis,
                                super_corridor_line_max_length=args.super_corridor_line_max_length,
                                super_safe_corridor_line_max_length=args.super_safe_corridor_line_max_length,
-                               super_corridor_bound_dis=args.super_corridor_bound_dis)
+                               super_corridor_bound_dis=args.super_corridor_bound_dis,
+                               super_inflation_step=args.super_inflation_step)
 
             # ---- Launch SUPER ----
             if ros_proc is not None:
@@ -862,6 +868,28 @@ def main(args):
                 if len(waypoints) < 2:
                     print(f"  [attempt {attempts}] insufficient command samples, skip", flush=True)
                     continue
+
+                # Reject trajectories with large velocity direction changes
+                # (SUPER backup_traj can cause near-180° reversals in dense scenes).
+                if args.max_yaw_change_deg > 0 and len(waypoints) > YAW_CHECK_WINDOW:
+                    _vx, _vy = waypoints[:, 4], waypoints[:, 5]
+                    _sh = np.sqrt(_vx**2 + _vy**2)
+                    _worst = 0.0
+                    for _i in range(len(waypoints) - YAW_CHECK_WINDOW):
+                        _s1, _s2 = _sh[_i], _sh[_i + YAW_CHECK_WINDOW]
+                        if _s1 < 0.3 or _s2 < 0.3:
+                            continue
+                        _dot = _vx[_i]*_vx[_i+YAW_CHECK_WINDOW] + _vy[_i]*_vy[_i+YAW_CHECK_WINDOW]
+                        _cos = _dot / (_s1 * _s2 + 1e-8)
+                        _ang = math.acos(max(-1.0, min(1.0, _cos)))
+                        if _ang > _worst:
+                            _worst = _ang
+                    _worst_deg = math.degrees(_worst)
+                    if _worst_deg > args.max_yaw_change_deg:
+                        print(f"  [attempt {attempts}] velocity reversal {_worst_deg:.0f}° "
+                              f"> {args.max_yaw_change_deg:.0f}°, skip", flush=True)
+                        continue
+
                 total_dur = float(waypoints[-1, 0] - waypoints[0, 0]) if len(waypoints) > 1 else 0.0
                 poly_coeffs = np.zeros((0, 3, 8), dtype=np.float64)
                 durations = np.zeros((0,), dtype=np.float64)
@@ -1026,6 +1054,12 @@ def parse_args():
                         help="Max seconds allowed for one goal execution across multiple replans")
     parser.add_argument("--max_replan_segments", type=int, default=20,
                         help="Max number of /planning_cmd/poly_traj segments to stitch for one goal")
+    parser.add_argument("--super_inflation_step", type=int, default=None,
+                        help="Override rog_map.inflation_step (default 2). "
+                             "Effective inflation = inflation_step * inflation_resolution(0.2m).")
+    parser.add_argument("--max_yaw_change_deg", type=float, default=90.0,
+                        help="Reject trajectories whose velocity direction changes more than this "
+                             "(degrees, 0.5s window). 0 = disabled.")
 
     valid_keys = {a.dest for a in parser._actions}
     unknown = sorted(k for k in cfg if k not in valid_keys)
