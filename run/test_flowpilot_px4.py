@@ -57,7 +57,7 @@ from geometry_msgs.msg import PoseStamped, TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, PointCloud2, PointField
 from sensor_msgs import point_cloud2
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Float64
 from visualization_msgs.msg import Marker
 
 
@@ -271,6 +271,22 @@ def quat_mul(q1, q2):
         w1*y2 - x1*z2 + y1*w2 + z1*x2,
         w1*z2 + x1*y2 - y1*x2 + z1*w2,
     ], dtype=np.float64)
+
+
+def quat_to_yaw(q: np.ndarray) -> float:
+    """Extract yaw (rad) from quaternion [qw, qx, qy, qz]."""
+    w, x, y, z = q
+    return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+
+def angle_diff(a: float, b: float) -> float:
+    """Signed shortest angular difference a - b, result in (-pi, pi]."""
+    d = a - b
+    while d > np.pi:
+        d -= 2 * np.pi
+    while d <= -np.pi:
+        d += 2 * np.pi
+    return d
 
 
 def yaw_frame_from_start_to_goal(start, goal, eps=1e-6):
@@ -669,15 +685,15 @@ def parse_args():
                    default='/root/workspace/YOPO/run/poly-action-rw')
     p.add_argument('--device',             type=str, default='cuda')
     p.add_argument('--phase2_ckpt',        type=str,
-                   default='/root/workspace/YOPO/run/poly-action-rw/ckpt/super/ckpt_final.pt')
+                   default='/root/workspace/YOPO/run/poly-action-rw/ckpt/super_clean/ckpt_final.pt')
     p.add_argument('--vae_pth',            type=str,
                    default='/root/workspace/YOPO/run/poly-action-rw/ckpt/2026-3-24/Wan2.2_VAE.pth')
     p.add_argument('--depth_encoder_ckpt', type=str, default='',
                    help='If set, use lightweight DepthEncoder instead of Wan2.2 VAE.')
     p.add_argument('--action_stats_path',  type=str,
-                   default='/root/workspace/YOPO/run/poly-action-rw/ckpt/super/action_stats_super.pt')
+                   default='/root/workspace/YOPO/run/poly-action-rw/ckpt/super_clean/action_stats_super_clean.pt')
     p.add_argument('--coeff_stats_path',   type=str,
-                   default='/root/workspace/YOPO/run/poly-action-rw/ckpt/super/coeff_stats_super.pt')
+                   default='/root/workspace/YOPO/run/poly-action-rw/ckpt/super_clean/coeff_stats_super_clean.pt')
     p.add_argument('--odom_topic',         type=str,
                    default='/some_object_name_vrpn_client/estimated_odometry')
     p.add_argument('--depth_topic',        type=str, default='/flowpilot/depth',
@@ -687,6 +703,9 @@ def parse_args():
                    help='Inference rate in Hz (default 1.25 = every 0.8 s).')
     p.add_argument('--v_cmd',              type=float, default=6.0)
     p.add_argument('--goal_reach_dist',    type=float, default=2.0)
+    p.add_argument('--yaw_align_deg',     type=float, default=45.0,
+                   help='Max yaw error (deg) before starting inference. '
+                        'OMMPC hovers and rotates in place first.')
     p.add_argument('--compile_model',      action='store_true')
     p.add_argument('--num_layers',         type=int, default=12)
     return p.parse_args()
@@ -707,8 +726,9 @@ def main():
 
     # --- ROS init ---
     rospy.init_node('flowpilot_infer', anonymous=False)
-    traj_pub  = rospy.Publisher('/flowpilot/best_traj_visual', PointCloud2, queue_size=1)
-    goal_pub  = rospy.Publisher('/flowpilot/goal_marker',      Marker,      queue_size=1)
+    traj_pub      = rospy.Publisher('/flowpilot/best_traj_visual', PointCloud2, queue_size=1)
+    goal_pub      = rospy.Publisher('/flowpilot/goal_marker',      Marker,      queue_size=1)
+    hover_yaw_pub = rospy.Publisher('/drone_0_planning/hover_yaw', Float64,     queue_size=1)
 
     rospy.Subscriber('/move_base_simple/goal', PoseStamped, _callback_set_goal, queue_size=1)
     rospy.Subscriber(args.odom_topic,  Odometry, _callback_odom,  queue_size=1)
@@ -799,6 +819,8 @@ def main():
     goal_seq = -1
     traj_id  = 0
     in_hover = False
+    yaw_aligning = False
+    yaw_align_rad = float(np.radians(args.yaw_align_deg))
     step_deadline = time.perf_counter()
     _prev_coefs  = None   # [8,3] descending power basis of last published trajectory
     _prev_t_snap = None   # rospy.Time of last snapshot
@@ -822,7 +844,23 @@ def main():
             in_hover = False
             _prev_coefs  = None   # reset on new goal so first traj starts from cur_pos
             _prev_t_snap = None
-            print(f'[run] goal=({goal_pos[0]:.1f},{goal_pos[1]:.1f},{goal_pos[2]:.1f})')
+            # Check if yaw alignment is needed
+            with _odom_lock:
+                _init_quat = _odom_quat.copy()
+                _init_pos  = _odom_pos.copy()
+            cur_yaw  = quat_to_yaw(_init_quat)
+            goal_yaw = float(np.arctan2(goal_pos[1] - _init_pos[1],
+                                        goal_pos[0] - _init_pos[0]))
+            yaw_err = abs(angle_diff(goal_yaw, cur_yaw))
+            if yaw_err > yaw_align_rad:
+                yaw_aligning = True
+                hover_yaw_pub.publish(Float64(data=goal_yaw))
+                print(f'[run] goal=({goal_pos[0]:.1f},{goal_pos[1]:.1f},{goal_pos[2]:.1f})'
+                      f'  yaw_err={np.degrees(yaw_err):.0f}° → rotating to {np.degrees(goal_yaw):.0f}°')
+            else:
+                yaw_aligning = False
+                print(f'[run] goal=({goal_pos[0]:.1f},{goal_pos[1]:.1f},{goal_pos[2]:.1f})'
+                      f'  yaw_err={np.degrees(yaw_err):.0f}° → inference')
 
         if goal_pos is not None:
             publish_goal_marker(goal_pub, goal_pos)
@@ -835,6 +873,21 @@ def main():
             cur_quat = _odom_quat.copy()
         with _depth_lock:
             cond_depth = _depth_img.copy()
+
+        # ---- Yaw alignment: wait for OMMPC to rotate in place ---------------
+        if yaw_aligning:
+            cur_yaw  = quat_to_yaw(cur_quat)
+            goal_yaw = float(np.arctan2(goal_pos[1] - cur_pos[1],
+                                        goal_pos[0] - cur_pos[0]))
+            yaw_err  = abs(angle_diff(goal_yaw, cur_yaw))
+            if yaw_err <= yaw_align_rad:
+                yaw_aligning = False
+                print(f'[yaw] aligned! err={np.degrees(yaw_err):.1f}° → starting inference')
+            else:
+                # Keep publishing desired yaw (OMMPC stays in HOVER, rotating)
+                hover_yaw_pub.publish(Float64(data=goal_yaw))
+                time.sleep(0.05)
+                continue
 
         # ---- ref acc/jerk from last predicted trajectory --------------------
         ref_acc  = np.zeros(3, dtype=np.float64)
@@ -915,7 +968,24 @@ def main():
         if not in_hover:
             dist = float(np.linalg.norm(goal_pos - cur_pos))
             if dist < args.goal_reach_dist:
-                print(f'[run] arrived! dist={dist:.2f}m. Hovering.')
+                # Publish a braking trajectory: decelerate from current
+                # velocity to zero at the goal position, then let OMMPC
+                # naturally transition to HOVER when the traj expires.
+                #
+                # Quintic (degree-5, pad to 8 coefs):
+                #   p(t) = p0 + v0*t - v0/(2*T)*t^2
+                #   v(t) = v0 - v0/T*t  →  v(T)=0
+                speed = float(np.linalg.norm(cur_vel[:2]))
+                T_brake = max(0.8, min(speed / 2.0, 2.0))  # 0.8–2.0 s
+                brake_coefs = np.zeros((8, 3), dtype=np.float64)
+                brake_coefs[7] = cur_pos                     # t^0
+                brake_coefs[6] = cur_vel                     # t^1
+                brake_coefs[5] = -cur_vel / (2.0 * T_brake)  # t^2
+                traj_id += 1
+                publish_poly_traj(poly_traj_pub, brake_coefs, T_brake,
+                                  traj_id, t_snap)
+                print(f'[run] arrived! dist={dist:.2f}m  speed={speed:.1f}m/s'
+                      f'  braking T={T_brake:.1f}s')
                 in_hover = True
 
         # ---- Rate control at infer_hz ---------------------------------------

@@ -397,11 +397,10 @@ def main(args):
     planner_cfg = os.path.join(CFG_PATH, "gcopter_config.yaml")
     planner = gcopter_planner.GcopterPlanner(planner_cfg)
 
-    # FlatnessMap (same physical params as planner config)
-    cfg = planner.getConfig()
-    pp = cfg["physical_params"]
+    # FlatnessMap — PX4 Gazebo iris dynamics for camera pose rendering.
+    # See PX4-Autopilot/.../models/iris/iris.sdf: mass=1.5, rotor H-force drag only.
     flatmap = gcopter_planner.FlatnessMap()
-    flatmap.reset(pp[0], pp[1], pp[2], pp[3], pp[4], pp[5])
+    flatmap.reset(1.5, 9.81, 0.556, 0.556, 0.0, 1e-4)  # mass, grav, dh, dv, cp, veps
 
     save_root = args.save_root
     os.makedirs(save_root, exist_ok=True)
