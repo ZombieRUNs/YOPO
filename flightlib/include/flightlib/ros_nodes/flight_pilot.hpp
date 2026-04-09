@@ -9,6 +9,7 @@
 #include <boost/filesystem.hpp>
 #include <cmath>
 #include <memory>
+#include <string>
 #include "std_msgs/Empty.h"
 // flightlib
 #include "flightlib/bridges/unity_bridge.hpp"
@@ -40,6 +41,8 @@ class FlightPilot {
 	bool connectUnity(void);
 	void disconnectUnity(void);
 	bool loadParams(const YAML::Node& cfg);
+	void applyRosParamOverrides(void);
+	std::string resolveConfigPath(const std::string& cfg_path) const;
 	bool configCamera(const YAML::Node& cfg);
 	void computeDepthImage(const cv::Mat& left_frame, const cv::Mat& right_frame, cv::Mat* const depth);
 	bool spawnTreesAndSavePointCloud();
@@ -50,6 +53,7 @@ class FlightPilot {
 	ros::NodeHandle pnh_;
 
 	// publisher & subscriber
+	std::string config_path_;
 	std::string odom_topic_;
 	ros::Publisher stereo_pub, left_img_pub, depth_pub, cam_info_pub;
 	ros::Subscriber state_est_sub_, spawn_tree_sub_, clear_tree_sub_, save_pc_sub_;

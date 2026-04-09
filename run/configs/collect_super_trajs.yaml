@@ -11,7 +11,7 @@ trajs_per_scene: 20
 gcopter_trajs_root: dataset/gcopter_trajs
 
 # Output
-save_root: dataset/super_trajs
+save_root: dataset/super_trajs_v1
 
 # Depth + RGB resolution
 img_width:  160
@@ -24,7 +24,68 @@ min_dist: 30.0
 max_dist: 40.0
 
 rgb_fps: 30.0
+
+# Extra pitch applied after the body attitude has been reconstructed.
+# This is a render-only camera/view adjustment in degrees:
+#   0    -> keep the recovered body attitude unchanged
+#   -15  -> look slightly downward, matching the common PX4 render setup
+# The value is converted to a quaternion and right-multiplied onto the
+# recovered render attitude inside collect_images().
 camera_pitch_deg: -15.0
+
+# Render-time attitude reconstruction.
+# `explicit_flatness` makes the geometry in collect_super_trajs.py explicit:
+# position/velocity/acceleration/yaw -> R_wb -> quaternion.
+# `gcopter_flatmap` keeps the legacy GCOPTER helper:
+#   flatmap.forward(vel, acc, jer, psi, 0) -> thrust, quat, body_rate
+attitude_solver: explicit_flatness
+
+# Whether the explicit flatness solver should include drag compensation when
+# recovering body z-axis from reference acceleration.
+# true:
+#   b3 ~ normalize(a_ref + g e3 + drag_acc)
+# false:
+#   b3 ~ normalize(a_ref + g e3)
+# 建议保留 true，这样显式 flatness 解与现有 GCOPTER FlatnessMap 更接近。
+flatness_use_drag: true
+
+# EMA-based smooth perturbation. This does not modify SUPER's executed command
+# trace saved in waypoints.npy; it only affects the render-time state used to
+# generate image observations and the extra render_*.npy debug files.
+# 也就是说：
+# - waypoints.npy 仍然保存 SUPER 实际执行的 p/v/a/j 轨迹
+# - EMA 只作用在 Flightmare 渲染时送入 env.setState() 的姿态恢复链
+# - 因而不会篡改原始执行轨迹记录，但会改变 depth/RGB 的时序分布
+ema_enable: true
+
+# Each trajectory samples one beta per parameter stream, then keeps that beta
+# fixed for all time steps of that trajectory.
+# Update rule:
+#   ema_new = beta * current_sample + (1 - beta) * ema_prev
+# Smaller beta -> slower drift, stronger temporal correlation.
+# Larger beta  -> faster response, closer to per-step random sampling.
+ema_beta_min: 0.01
+ema_beta_max: 0.10
+
+# Relative sampling range for HorizDrag before EMA smoothing.
+# Example: base HorizDrag = 0.70, rel = 0.15
+# -> raw samples are drawn from [0.595, 0.805], then EMA-smoothed over time.
+# This affects the drag-compensated flatness attitude recovery only.
+ema_horiz_drag_rel: 0.15
+
+# Relative sampling range for VertDrag before EMA smoothing.
+# Same mechanism as ema_horiz_drag_rel, but applied to the vertical drag term.
+ema_vert_drag_rel: 0.15
+
+# Relative sampling range for render-time velocity scale before EMA smoothing.
+# This does not change the saved waypoint velocity in waypoints.npy.
+# Instead, it perturbs the velocity used during:
+#   1. yaw extraction  psi = atan2(vy, vx) + yaw_bias
+#   2. render-time flatness attitude recovery
+#   3. env.setState(pos, vel_render, acc, quat)
+# So this parameter mainly changes the rendered image distribution and the
+# smoothness of the visual motion cues.
+ema_vel_scale_rel: 0.10
 
 # --- SUPER-specific ---
 

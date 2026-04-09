@@ -15,6 +15,8 @@ RUN sed -i 's|http://archive.ubuntu.com|http://mirrors.tuna.tsinghua.edu.cn|g' /
 # ---- 1. System packages ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake git wget curl ca-certificates gnupg2 lsb-release \
+    pkg-config \
+    pcl-tools \
     libzmqpp-dev libopencv-dev libpcl-dev libeigen3-dev \
     libboost-all-dev libflann-dev \
     libgl1-mesa-glx libgl1-mesa-dri libglu1-mesa libx11-6 \
@@ -174,7 +176,13 @@ EOF
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cpufrequtils \
+    libdw-dev \
+    libglfw3-dev \
+    libglew-dev \
+    libncurses5-dev \
+    libncursesw5-dev \
     libompl-dev \
+    libyaml-cpp-dev \
     ros-noetic-std-msgs \
     ros-noetic-geometry-msgs \
     ros-noetic-visualization-msgs \
@@ -183,6 +191,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-noetic-gazebo-plugins \
     ros-noetic-mavros \
     ros-noetic-mavros-extras \
+    ros-noetic-rosfmt \
     ros-noetic-ddynamic-reconfigure \
     ros-noetic-rqt \
     ros-noetic-rqt-graph \

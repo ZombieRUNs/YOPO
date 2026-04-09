@@ -36,7 +36,6 @@ import argparse
 import json
 import math
 import os
-import shutil
 import atexit
 import signal
 import subprocess
@@ -407,8 +406,138 @@ def _quat_mul(q1, q2):
     ], dtype=np.float64)
 
 
+def _safe_normalize(vec: np.ndarray, eps: float = 1e-9, fallback=None) -> np.ndarray:
+    vec = np.asarray(vec, dtype=np.float64)
+    n = float(np.linalg.norm(vec))
+    if np.isfinite(n) and n > eps:
+        return vec / n
+    if fallback is None:
+        return np.zeros_like(vec, dtype=np.float64)
+    fallback = np.asarray(fallback, dtype=np.float64)
+    nf = float(np.linalg.norm(fallback))
+    if np.isfinite(nf) and nf > eps:
+        return fallback / nf
+    return np.zeros_like(vec, dtype=np.float64)
+
+
+def _quat_from_rotmat(R: np.ndarray) -> np.ndarray:
+    """Convert rotation matrix R_wb to quaternion [w, x, y, z]."""
+    R = np.asarray(R, dtype=np.float64)
+    tr = float(np.trace(R))
+
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (R[2, 1] - R[1, 2]) / s
+        qy = (R[0, 2] - R[2, 0]) / s
+        qz = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        qw = (R[2, 1] - R[1, 2]) / s
+        qx = 0.25 * s
+        qy = (R[0, 1] + R[1, 0]) / s
+        qz = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        qw = (R[0, 2] - R[2, 0]) / s
+        qx = (R[0, 1] + R[1, 0]) / s
+        qy = 0.25 * s
+        qz = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        qw = (R[1, 0] - R[0, 1]) / s
+        qx = (R[0, 2] + R[2, 0]) / s
+        qy = (R[1, 2] + R[2, 1]) / s
+        qz = 0.25 * s
+
+    quat = np.array([qw, qx, qy, qz], dtype=np.float64)
+    return _safe_normalize(quat, fallback=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64))
+
+
+def _ensure_quat_sign_continuity(quat: np.ndarray, prev_quat: np.ndarray) -> np.ndarray:
+    quat = np.asarray(quat, dtype=np.float64)
+    if prev_quat is None:
+        return quat
+    if float(np.dot(quat, prev_quat)) < 0.0:
+        return -quat
+    return quat
+
+
+def _sample_uniform_relative(base: float, rel_range: float, rng, min_value: float = 0.0) -> float:
+    base = float(base)
+    rel_range = max(0.0, float(rel_range))
+    lo = max(min_value, base * (1.0 - rel_range))
+    hi = max(lo, base * (1.0 + rel_range))
+    return float(rng.uniform(lo, hi))
+
+
+def _ema_update(prev_value, sample_value, beta: float):
+    beta = float(np.clip(beta, 1e-6, 1.0))
+    return beta * sample_value + (1.0 - beta) * prev_value
+
+
+def solve_attitude_from_flatness(vel: np.ndarray,
+                                 acc: np.ndarray,
+                                 psi_ref: float,
+                                 physical_params: dict,
+                                 prev_quat: np.ndarray = None) -> np.ndarray:
+    """Recover q_wb from reference velocity/acceleration/yaw.
+
+    This follows the differential-flatness geometry used by the current codebase:
+    q_wb is a world<-body quaternion, so the columns of R_wb are the body axes
+    expressed in the world frame.
+
+    Compared with the textbook point-mass form b3 ~ a + g e3, we optionally add a
+    simple drag compensation term so the explicit Python implementation stays
+    consistent with GCOPTER's FlatnessMap convention.
+    """
+    vel = np.asarray(vel, dtype=np.float64)
+    acc = np.asarray(acc, dtype=np.float64)
+
+    mass = max(float(physical_params["mass"]), 1e-6)
+    gravity = float(physical_params["gravity"])
+    horiz_drag = max(float(physical_params["horiz_drag"]), 0.0)
+    vert_drag = max(float(physical_params["vert_drag"]), 0.0)
+    paras_drag = max(float(physical_params["paras_drag"]), 0.0)
+    speed_eps = max(float(physical_params["speed_eps"]), 1e-9)
+    use_drag = bool(physical_params.get("use_drag", True))
+
+    # GCOPTER FlatnessMap models drag as a world-frame correction term built from
+    # velocity. We mirror that structure here so the explicit solver remains close
+    # to the legacy implementation while keeping the geometry transparent.
+    drag_acc = np.zeros(3, dtype=np.float64)
+    if use_drag:
+        speed_term = math.sqrt(float(np.dot(vel, vel)) + speed_eps)
+        w_term = 1.0 + paras_drag * speed_term
+        drag_acc[0] = (horiz_drag / mass) * w_term * vel[0]
+        drag_acc[1] = (horiz_drag / mass) * w_term * vel[1]
+        drag_acc[2] = (vert_drag / mass) * w_term * vel[2]
+
+    # Under the ENU convention used here: a = -g e3 + (F/m) b3 - drag_acc,
+    # hence b3 aligns with a + g e3 + drag_acc.
+    alpha = acc + drag_acc + np.array([0.0, 0.0, gravity], dtype=np.float64)
+    b3 = _safe_normalize(alpha, fallback=np.array([0.0, 0.0, 1.0], dtype=np.float64))
+
+    x_c = np.array([math.cos(psi_ref), math.sin(psi_ref), 0.0], dtype=np.float64)
+    x_c = _safe_normalize(x_c, fallback=np.array([1.0, 0.0, 0.0], dtype=np.float64))
+    y_c = np.array([-math.sin(psi_ref), math.cos(psi_ref), 0.0], dtype=np.float64)
+
+    b2 = np.cross(b3, x_c)
+    if float(np.linalg.norm(b2)) < 1e-6:
+        b2 = np.cross(b3, y_c)
+    b2 = _safe_normalize(b2, fallback=np.array([0.0, 1.0, 0.0], dtype=np.float64))
+    b1 = _safe_normalize(np.cross(b2, b3), fallback=np.array([1.0, 0.0, 0.0], dtype=np.float64))
+    b2 = _safe_normalize(np.cross(b3, b1), fallback=b2)
+
+    R_wb = np.stack([b1, b2, b3], axis=1)
+    quat = _quat_from_rotmat(R_wb)
+    return _ensure_quat_sign_continuity(quat, prev_quat)
+
+
 def collect_images(env, flatmap, waypoints, img_width, img_height,
-                   camera_pitch_deg=0.0, yaw_bias=0.0):
+                   camera_pitch_deg=0.0, yaw_bias=0.0,
+                   attitude_solver="gcopter_flatmap",
+                   physical_params=None, ema_cfg=None):
     """Walk trajectory and collect depth/RGB via Flightmare.
 
     Args:
@@ -417,34 +546,95 @@ def collect_images(env, flatmap, waypoints, img_width, img_height,
                   --yaw_rand_deg > 0, simulating the gap between the
                   flatness-derived yaw and the real PX4 yaw controller.
     """
+    if attitude_solver not in ("gcopter_flatmap", "explicit_flatness"):
+        raise ValueError(f"Unsupported attitude_solver: {attitude_solver}")
+    if physical_params is None:
+        raise ValueError("physical_params must be provided for render-time attitude reconstruction.")
+
     M = len(waypoints)
     depths = np.zeros((M, img_height, img_width), dtype=np.float16)
     rgbs   = np.zeros((M, img_height, img_width, 3), dtype=np.uint8)
+    render_quat_wxyz = np.zeros((M, 4), dtype=np.float32)
+    render_vel_world = np.zeros((M, 3), dtype=np.float32)
+    render_horiz_drag = np.zeros((M,), dtype=np.float32)
+    render_vert_drag = np.zeros((M,), dtype=np.float32)
+    render_vel_scale = np.ones((M,), dtype=np.float32)
 
     pitch_rad = float(camera_pitch_deg) * math.pi / 180.0
     q_pitch   = np.array([math.cos(0.5 * pitch_rad), 0.0,
                            math.sin(0.5 * pitch_rad), 0.0], dtype=np.float64)
+    q_identity = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+    ema_cfg = ema_cfg or {}
+    ema_enable = bool(ema_cfg.get("enable", False))
+    rng = np.random.default_rng()
+
+    base_horiz_drag = float(physical_params["horiz_drag"])
+    base_vert_drag = float(physical_params["vert_drag"])
+    beta_min = float(ema_cfg.get("beta_min", 0.01))
+    beta_max = float(ema_cfg.get("beta_max", 0.10))
+    beta_min = max(1e-6, beta_min)
+    beta_max = max(beta_min, beta_max)
+    horiz_drag_rel = max(0.0, float(ema_cfg.get("horiz_drag_rel", 0.0)))
+    vert_drag_rel = max(0.0, float(ema_cfg.get("vert_drag_rel", 0.0)))
+    vel_scale_rel = max(0.0, float(ema_cfg.get("vel_scale_rel", 0.0)))
+
+    beta_horiz_drag = float(rng.uniform(beta_min, beta_max)) if ema_enable else 1.0
+    beta_vert_drag = float(rng.uniform(beta_min, beta_max)) if ema_enable else 1.0
+    beta_velocity = float(rng.uniform(beta_min, beta_max)) if ema_enable else 1.0
+
+    ema_horiz_drag = base_horiz_drag
+    ema_vert_drag = base_vert_drag
+    ema_vel_scale = 1.0
+    prev_quat = None
+    prev_psi = yaw_bias
 
     for k in range(M):
         t, px, py, pz, vx, vy, vz, ax, ay, az, jx, jy, jz = waypoints[k]
-        vel = np.array([vx, vy, vz]);  acc = np.array([ax, ay, az])
+        vel = np.array([vx, vy, vz], dtype=np.float64)
+        acc = np.array([ax, ay, az], dtype=np.float64)
         jer = np.array([jx, jy, jz])
 
-        speed = math.sqrt(vx*vx + vy*vy + vz*vz)
-        if speed < 1e-3:
-            quat = np.array([1.0, 0.0, 0.0, 0.0])
+        if ema_enable:
+            sample_horiz_drag = _sample_uniform_relative(base_horiz_drag, horiz_drag_rel, rng, min_value=1e-6)
+            sample_vert_drag = _sample_uniform_relative(base_vert_drag, vert_drag_rel, rng, min_value=1e-6)
+            sample_vel_scale = _sample_uniform_relative(1.0, vel_scale_rel, rng, min_value=1e-3)
+
+            ema_horiz_drag = float(_ema_update(ema_horiz_drag, sample_horiz_drag, beta_horiz_drag))
+            ema_vert_drag = float(_ema_update(ema_vert_drag, sample_vert_drag, beta_vert_drag))
+            ema_vel_scale = float(_ema_update(ema_vel_scale, sample_vel_scale, beta_velocity))
         else:
-            psi = math.atan2(vy, vx) + yaw_bias
-            _thr, quat, _omg = flatmap.forward(vel, acc, jer, psi, 0.0)
-            quat = np.array(quat)
+            ema_horiz_drag = base_horiz_drag
+            ema_vert_drag = base_vert_drag
+            ema_vel_scale = 1.0
+
+        vel_render = ema_vel_scale * vel
+        speed_xy = math.hypot(float(vel_render[0]), float(vel_render[1]))
+        if speed_xy > 1e-6:
+            psi = math.atan2(float(vel_render[1]), float(vel_render[0])) + yaw_bias
+            prev_psi = psi
+        else:
+            psi = prev_psi
+
+        if attitude_solver == "gcopter_flatmap":
+            speed = float(np.linalg.norm(vel_render))
+            if speed < 1e-3:
+                quat = prev_quat.copy() if prev_quat is not None else q_identity.copy()
+            else:
+                _thr, quat, _omg = flatmap.forward(vel_render, acc, jer, psi, 0.0)
+                quat = _ensure_quat_sign_continuity(np.array(quat, dtype=np.float64), prev_quat)
+        else:
+            physical_now = dict(physical_params)
+            physical_now["horiz_drag"] = ema_horiz_drag
+            physical_now["vert_drag"] = ema_vert_drag
+            quat = solve_attitude_from_flatness(vel_render, acc, psi, physical_now, prev_quat=prev_quat)
 
         if abs(pitch_rad) > 1e-12:
             quat = _quat_mul(quat.astype(np.float64), q_pitch)
-            n = np.linalg.norm(quat)
-            if n > 1e-12:
-                quat /= n
+        quat = _safe_normalize(quat, fallback=prev_quat if prev_quat is not None else q_identity)
+        prev_quat = quat.copy()
 
-        env.setState(np.array([px, py, pz]), vel, acc, quat)
+        env.setState(np.array([px, py, pz], dtype=np.float64), vel_render, acc, quat)
         env.render()
 
         depth    = env.getDepthImage()[0][0]
@@ -459,8 +649,24 @@ def collect_images(env, flatmap, waypoints, img_width, img_height,
 
         depths[k] = depth.astype(np.float16)
         rgbs[k]   = rgb.astype(np.uint8)
+        render_quat_wxyz[k] = quat.astype(np.float32)
+        render_vel_world[k] = vel_render.astype(np.float32)
+        render_horiz_drag[k] = np.float32(ema_horiz_drag)
+        render_vert_drag[k] = np.float32(ema_vert_drag)
+        render_vel_scale[k] = np.float32(ema_vel_scale)
 
-    return depths, rgbs
+    render_debug = {
+        "quat_wxyz": render_quat_wxyz,
+        "vel_world": render_vel_world,
+        "horiz_drag": render_horiz_drag,
+        "vert_drag": render_vert_drag,
+        "vel_scale": render_vel_scale,
+        "beta_horiz_drag": beta_horiz_drag,
+        "beta_vert_drag": beta_vert_drag,
+        "beta_velocity": beta_velocity,
+        "ema_enabled": ema_enable,
+    }
+    return depths, rgbs, render_debug
 
 
 def save_rgb_video(rgbs: np.ndarray, out_path: str, fps: float) -> None:
@@ -645,6 +851,10 @@ def main(args):
         raise ValueError("--goal_timeout must be positive.")
     if args.max_replan_segments <= 0:
         raise ValueError("--max_replan_segments must be positive.")
+    if args.ema_beta_min <= 0 or args.ema_beta_max < args.ema_beta_min or args.ema_beta_max > 1.0:
+        raise ValueError("Require 0 < ema_beta_min <= ema_beta_max <= 1.")
+    if args.ema_horiz_drag_rel < 0 or args.ema_vert_drag_rel < 0 or args.ema_vel_scale_rel < 0:
+        raise ValueError("EMA relative ranges must be non-negative.")
 
     # Read SUPER runtime params from configs and align collector checks.
     super_params = load_super_runtime_params()
@@ -685,7 +895,16 @@ def main(args):
     # iris.sdf: mass=1.5, no body drag, rotor H-force drag only.
     # Effective DH ≈ 4 * hover_omega(~794) * rotorDragCoeff(0.000175) ≈ 0.556
     flatmap  = gcopter_planner.FlatnessMap()
-    flatmap.reset(1.5, 9.81, 0.556, 0.556, 0.0, 1e-4)  # mass, grav, dh, dv, cp, veps
+    flatmap.reset(pp[0], pp[1], pp[2], pp[3], pp[4], pp[5])
+    physical_params = {
+        "mass": float(pp[0]),
+        "gravity": float(pp[1]),
+        "horiz_drag": float(pp[2]),
+        "vert_drag": float(pp[3]),
+        "paras_drag": float(pp[4]),
+        "speed_eps": float(pp[5]),
+        "use_drag": bool(args.flatness_use_drag),
+    }
 
     # ------------------------------------------------------------------ #
     #  roscore + rospy node (initialised once)                            #
@@ -897,12 +1116,22 @@ def main(args):
                 # Collect depth/RGB via Flightmare
                 yaw_bias = (np.random.uniform(-1, 1) * math.radians(args.yaw_rand_deg)
                             if args.yaw_rand_deg > 0 else 0.0)
-                depths, rgbs = collect_images(
+                depths, rgbs, render_debug = collect_images(
                     env, flatmap, waypoints,
                     img_width=args.img_width,
                     img_height=args.img_height,
                     camera_pitch_deg=args.camera_pitch_deg,
                     yaw_bias=yaw_bias,
+                    attitude_solver=args.attitude_solver,
+                    physical_params=physical_params,
+                    ema_cfg={
+                        "enable": args.ema_enable,
+                        "beta_min": args.ema_beta_min,
+                        "beta_max": args.ema_beta_max,
+                        "horiz_drag_rel": args.ema_horiz_drag_rel,
+                        "vert_drag_rel": args.ema_vert_drag_rel,
+                        "vel_scale_rel": args.ema_vel_scale_rel,
+                    },
                 )
 
                 # Save
@@ -917,6 +1146,11 @@ def main(args):
                 np.save(os.path.join(tdir, "start_pva.npy"),   start_pva)
                 np.save(os.path.join(tdir, "goal_pos.npy"),    goal_pos)
                 np.save(os.path.join(tdir, "yaw_bias.npy"),   np.float32(yaw_bias))
+                np.save(os.path.join(tdir, "render_quat_wxyz.npy"), render_debug["quat_wxyz"])
+                np.save(os.path.join(tdir, "render_vel_world.npy"), render_debug["vel_world"])
+                np.save(os.path.join(tdir, "render_horiz_drag.npy"), render_debug["horiz_drag"])
+                np.save(os.path.join(tdir, "render_vert_drag.npy"), render_debug["vert_drag"])
+                np.save(os.path.join(tdir, "render_vel_scale.npy"), render_debug["vel_scale"])
 
                 with open(os.path.join(tdir, "meta.json"), "w") as f:
                     json.dump({
@@ -943,6 +1177,23 @@ def main(args):
                         "img_height":     args.img_height,
                         "rgb_fps":        args.rgb_fps,
                         "camera_pitch_deg": args.camera_pitch_deg,
+                        "attitude_solver": args.attitude_solver,
+                        "flatness_use_drag": args.flatness_use_drag,
+                        "ema_enable": args.ema_enable,
+                        "ema_beta_min": args.ema_beta_min,
+                        "ema_beta_max": args.ema_beta_max,
+                        "ema_horiz_drag_rel": args.ema_horiz_drag_rel,
+                        "ema_vert_drag_rel": args.ema_vert_drag_rel,
+                        "ema_vel_scale_rel": args.ema_vel_scale_rel,
+                        "ema_beta_horiz_drag": render_debug["beta_horiz_drag"],
+                        "ema_beta_vert_drag": render_debug["beta_vert_drag"],
+                        "ema_beta_velocity": render_debug["beta_velocity"],
+                        "gcopter_vehicle_mass": physical_params["mass"],
+                        "gcopter_gravity": physical_params["gravity"],
+                        "gcopter_horiz_drag": physical_params["horiz_drag"],
+                        "gcopter_vert_drag": physical_params["vert_drag"],
+                        "gcopter_paras_drag": physical_params["paras_drag"],
+                        "gcopter_speed_eps": physical_params["speed_eps"],
                     }, f, indent=2)
 
                 traj_count += 1
@@ -991,6 +1242,17 @@ def load_yaml_config(path: str) -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def _argparse_bool(v):
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {v}")
+
+
 def parse_args():
     argv = [a for a in sys.argv[1:] if not a.startswith("__")]
     pre = argparse.ArgumentParser(add_help=False)
@@ -1019,6 +1281,23 @@ def parse_args():
                              "Each trajectory gets one uniform sample in "
                              "[-yaw_rand_deg, +yaw_rand_deg] added to the "
                              "flatness yaw. 0 = disabled (default).")
+    parser.add_argument("--attitude_solver", type=str, default="gcopter_flatmap",
+                        choices=["gcopter_flatmap", "explicit_flatness"],
+                        help="How render-time attitude is reconstructed from the trajectory.")
+    parser.add_argument("--flatness_use_drag", type=_argparse_bool, default=True,
+                        help="Whether the explicit flatness solver includes drag compensation.")
+    parser.add_argument("--ema_enable", type=_argparse_bool, default=False,
+                        help="Enable EMA-based smooth perturbation on drag and render-time velocity.")
+    parser.add_argument("--ema_beta_min", type=float, default=0.01,
+                        help="Lower bound of per-trajectory EMA beta sampling.")
+    parser.add_argument("--ema_beta_max", type=float, default=0.10,
+                        help="Upper bound of per-trajectory EMA beta sampling.")
+    parser.add_argument("--ema_horiz_drag_rel", type=float, default=0.15,
+                        help="Relative uniform sampling range for HorizDrag before EMA smoothing.")
+    parser.add_argument("--ema_vert_drag_rel", type=float, default=0.15,
+                        help="Relative uniform sampling range for VertDrag before EMA smoothing.")
+    parser.add_argument("--ema_vel_scale_rel", type=float, default=0.10,
+                        help="Relative uniform sampling range for the render-time velocity scale before EMA smoothing.")
     # SUPER-specific
     parser.add_argument("--startup_wait",  type=float, default=8.0,
                         help="Extra seconds after odom appears for ROG-Map PCD loading")
